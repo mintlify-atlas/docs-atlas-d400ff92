@@ -40,10 +40,10 @@ public sealed class RoomGatewaySessionFlow
     public Task<string> CreateRoomAsync(string sessionToken, RoomGatewayLaunchSpec launchSpec, ...) { /* ... */ }
     public Task<RoomGatewayJoinResult> JoinRoomAsync(string sessionToken, string region, string serverId, string roomId, ...) { /* ... */ }
     public Task<RoomGatewayReadyResult> SetReadyAsync(...) { /* ... */ }
-    public Task BeginLoadingAsync(...) { /* ... */ }
-    public Task ReportAssetsLoadedAsync(...) { /* ... */ }
-    public Task<RoomGatewayBattleStartResult> WaitForBattleStartAsync(...) { /* ... */ }
-    public Task<RoomGatewaySubscribeResult> SubscribeStateSyncAsync(...) { /* ... */ }
+    public Task<RoomGatewayBeginLoadingResult> BeginLoadingAsync(...) { /* ... */ }
+    public Task<RoomGatewayReportAssetsLoadedResult> ReportAssetsLoadedAsync(...) { /* ... */ }
+    public Task<RoomGatewayGetSnapshotResult> WaitForBattleStartAsync(...) { /* ... */ }
+    public Task<RoomGatewayStateSyncSubscriptionResult> SubscribeStateSyncAsync(...) { /* ... */ }
     public Task<RoomGatewayStagedRestoreResult> RestoreAsync(...) { /* ... */ }
 }
 ```

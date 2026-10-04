@@ -17,7 +17,7 @@ AbilityKit ships two complementary control-flow packages that answer different q
   <Tab title="HFSM">
     **Use when:** You need to express *state identity* — an entity is in exactly one state at a time, states have enter/exit behaviors, and transitions fire based on conditions or incoming events.
 
-    **Core metaphor:** A `StateMachine<TOwnId, TStateId, TEvent>` holds a current active state. Every tick calls `OnLogic` on the active state. `AddTransition` registers condition-based switches; `AddTriggerableTransition` registers event-driven switches via the `ITriggerable<TEvent>` interface.
+    **Core metaphor:** A `StateMachine<TOwnId, TStateId, TEvent>` holds a current active state. Every tick calls `OnLogic()` on the active state. `AddTransition` registers condition-based switches; `AddTriggerTransition` / `AddTriggerTransitionFromAny` register event-driven switches via the `ITriggerable<TEvent>` interface.
 
     **Typical uses:** NPC patrol → chase → attack → retreat, character idle/move/jump/stagger, boss phase 1 → phase 2 → enraged, ability active/cooldown/locked states.
   </Tab>
@@ -130,38 +130,38 @@ public sealed class FlowContext
 `StateMachine<TOwnId, TStateId, TEvent>` is the root object. States are added with `AddState`, and transitions connect them:
 
 ```csharp
-var fsm = new StateMachine<string, string, string>(ownerId: "NPC_001");
+var fsm = new StateMachine<string, string, string>();
 
-fsm.AddState("Patrol", new State(
-    onEnter: () => BeginPatrolRoute(),
-    onLogic: dt => FollowPatrolRoute(dt),
-    onExit: () => StopMovement()
+fsm.AddState("Patrol", new State<string, string>(
+    onEnter: _ => BeginPatrolRoute(),
+    onLogic: _ => FollowPatrolRoute(),
+    onExit:  _ => StopMovement()
 ));
 
-fsm.AddState("Chase", new State(
-    onEnter: () => LockOnTarget(target),
-    onLogic: dt => MoveToward(target, dt)
+fsm.AddState("Chase", new State<string, string>(
+    onEnter: _ => LockOnTarget(target),
+    onLogic: _ => MoveToward(target)
 ));
 
-fsm.AddState("Attack", new State(
-    onEnter: () => PlayAttackAnimation()
+fsm.AddState("Attack", new State<string, string>(
+    onEnter: _ => PlayAttackAnimation()
 ));
 
-// Condition-based transitions:
-fsm.AddTransition("Patrol", "Chase", new Transition(t => DistanceTo(target) < chaseRange));
-fsm.AddTransition("Chase", "Attack", new Transition(t => DistanceTo(target) < attackRange));
+// Condition-based transitions (from, to, condition):
+fsm.AddTransition(new Transition("Patrol", "Chase", t => DistanceTo(target) < chaseRange));
+fsm.AddTransition(new Transition("Chase",  "Attack", t => DistanceTo(target) < attackRange));
 
 // Time-delayed transition (return to patrol after 3 seconds of attacking):
-fsm.AddTransition("Attack", "Patrol", new TransitionAfter("Attack", "Patrol", delay: 3.0f));
+fsm.AddTransition(new TransitionAfter("Attack", "Patrol", delay: 3.0f));
 
 // Event-driven transition (take damage → enter Hurt regardless of current state):
-fsm.AddTriggerableTransition("TakeDamage", new Transition(from: "any", to: "Hurt"));
+fsm.AddTriggerTransitionFromAny("TakeDamage", new Transition("", "Hurt"));
 
 fsm.SetStartState("Patrol");
 fsm.Init();
 ```
 
-Every tick, the host system calls `fsm.OnLogic(deltaTime)`. The state machine evaluates outgoing transitions from the active state; if one's `ShouldTransition()` returns true, the machine calls the active state's `OnExit`, the transition's `BeforeTransition` / `AfterTransition` hooks, and the target state's `OnEnter`.
+Every tick, the host system calls `fsm.OnLogic()`. The state machine evaluates outgoing transitions from the active state; if one's `ShouldTransition()` returns true, the machine calls the active state's `OnExit`, the transition's `BeforeTransition` / `AfterTransition` hooks, and the target state's `OnEnter`.
 
 ### ITriggerable — Event-Driven Transitions
 
@@ -277,7 +277,7 @@ The two packages are designed to complement each other at the boundaries where p
 5. `FlowCompletion.cs` — the external signal object.
 
 **HFSM:**
-1. `StateMachine.cs` — `AddState`, `AddTransition`, `AddTriggerableTransition`, `OnLogic`.
+1. `StateMachine.cs` — `AddState`, `AddTransition`, `AddTriggerTransition`, `AddTriggerTransitionFromAny`, `OnLogic`.
 2. `ITriggerable.cs` — event-driven trigger interface.
 3. `TransitionAfter.cs` — timer-gated transition.
 4. `DecoratedState.cs` — AOP wrapper.

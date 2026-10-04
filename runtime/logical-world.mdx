@@ -95,7 +95,7 @@ The Host never needs to know whether a world uses Entitas, Svelto, or the built-
 
 The MOBA Console Demo's `ConsoleBattleBootstrapper` illustrates how all these layers connect. Conceptually the flow is:
 
-```
+```text
 BattleStartConfig
   └── IWorldModule list (MobaWorldBootstrapModule, ...)
         └── WorldManager.Create(WorldCreateOptions)

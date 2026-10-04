@@ -1,7 +1,7 @@
 ---
 title: "Combat Primitives: Targeting, Projectile, Damage, and More"
 sidebarTitle: "Combat Primitives"
-description: "Pure-C# combat building blocks — Targeting pipeline, Projectile world, Damage calculation, Motion solver, Collision, Navigation, Attributes, and Modifiers."
+description: "AbilityKit combat primitives: Targeting, Projectile, Damage, Motion, Collision, Navigation, Attributes, and Modifiers in pure C# for server and test use."
 ---
 
 AbilityKit's combat layer is a collection of small, composable **pure C# primitives** — no Unity dependency, no ECS requirement, no frame-sync assumption. Each primitive solves exactly one mechanical concern. A skill can use Targeting to find candidates, Projectile to fly towards them, Damage to compute numeric results, and Motion to resolve movement constraints, all without any of those systems knowing about each other. This page surveys every combat primitive and the key types you need to integrate or extend them.

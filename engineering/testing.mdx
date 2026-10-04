@@ -117,7 +117,7 @@ The table below lists the key scripts and their purpose. Scripts prefixed `tools
 | Script | Purpose |
 |---|---|
 | `tools/run_test_gate.ps1` | Unified gate runner — interprets `test-gates.json`, produces structured artifacts, and provides the CI entry point for all layers. |
-| `tools/test-gates.json` | Gate definitions (29 gates, schema v6): P0 development blockers, P1 contract blockers, P2 regression baselines. |
+| `tools/test-gates.json` | Gate definitions (30 gates, schema v6): P0 development blockers, P1 contract blockers, P2 regression baselines. |
 | `tools/check_sample_baseline.ps1` | Golden baseline check — runs every manifest sample and compares normalised output against a committed reference file. |
 | `tools/capture_moba_acceptance_traces.ps1` | Runs Unity MOBA acceptance expectations in batch mode and copies the resulting `_trace.jsonl` files into the dotnet verdict baseline directory (`src/AbilityKit.Demo.Moba.Acceptance.Tests/Traces/`). |
 | `tools/run_moba_unity_headless_multiplayer.ps1` | MOBA Unity headless two-instance multiplayer smoke. |
@@ -233,7 +233,7 @@ Constraint rules are declared in JSON configuration files and are editable throu
 
 All test artifacts must be written to `local/Logs/` locally. The CI workflow overrides the output path to `artifacts/test-gates/` for upload, but that path must never be used as a local default.
 
-```
+```text
 local/Logs/
 ├── test-gates/                          ← gate runner output
 │   └── {yyyyMMdd-HHmmss}-{Gate}/

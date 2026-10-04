@@ -1,7 +1,7 @@
 ---
 title: "Gameplay Tags: Hierarchical State Identifiers for Combat"
 sidebarTitle: "Gameplay Tags"
-description: "How com.abilitykit.gameplaytags provides dot-separated hierarchical tags, container/query/stack APIs, and owner-scoped reference-counted state for combat rule evaluation."
+description: "com.abilitykit.gameplaytags: hierarchical dot-separated tags with container, query, stack, and reference-counted owner state for combat rule evaluation."
 ---
 
 Gameplay Tags are hierarchical, dot-separated string identifiers that represent boolean state facts about entities — `State.Control.Stunned`, `Combat.Buff.Shield`, `Immune.CrowdControl`. Unlike flat boolean flags, tags form a tree: any code that queries `HasTag("State.Control")` will match an entity that holds `State.Control.Stunned`, because the child satisfies the parent. This makes tags a powerful tool for expressing broad categories (all control effects) and precise states (only stun, not root) with the same data structure. The `com.abilitykit.gameplaytags` package provides the tag registry, container, query, requirements, and stack APIs. The `com.abilitykit.ability` package adds per-owner reference-counted state on top.

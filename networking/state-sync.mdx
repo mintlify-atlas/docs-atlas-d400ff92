@@ -110,9 +110,9 @@ The default capacity is 128 frames. Frequently storing and reading snapshots pro
 
 `PredictionCoordinator` manages the client-side prediction loop for state sync. It tracks the current prediction frame, a history of applied inputs per frame, and a dictionary of predicted state snapshots. When authoritative state arrives, it validates, reconciles, and replays inputs from the server-confirmed frame onward.
 
-**Prediction path** — `ProcessInput(command)` or `ProcessInputs(batch)` advances the local frame by one, records inputs to history, calls `IPredictionHandler.Predict(input, currentSlots, frame)` for each registered handler, then snapshots the frame-end state into `DictionarySnapshotStore`.
+**Prediction path** — `ProcessInput(IInputCommand)` or `ProcessInputs(batch)` advances the local frame by one, records inputs to history, calls `IPredictionHandler.Predict(input, currentSlots, frame)` for each registered handler, then snapshots the frame-end state into `DictionarySnapshotStore`.
 
-**Reconciliation path** — `ApplyServerSnapshot(serverFrame, serverSlots, objectId)` compares the server-authoritative state to the stored prediction for `serverFrame`. If `ConflictLevel.None`, it advances `confirmedFrame` and fires `OnServerStateApplied`. If a conflict is detected, it:
+**Reconciliation path** — `ApplyServerSnapshot(serverFrame, objectId, serverSlots)` compares the server-authoritative state to the stored prediction for `serverFrame`. If `ConflictLevel.None`, it advances `confirmedFrame` and fires `OnServerStateApplied`. If a conflict is detected, it:
 1. Captures the complete list of input batches from `serverFrame` to the original predicted frame.
 2. Overwrites current slots with the authoritative server state.
 3. Sets `confirmedFrame = serverFrame` and calls `PruneBefore(serverFrame)`.

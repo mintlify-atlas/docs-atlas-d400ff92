@@ -51,15 +51,26 @@ public readonly struct IEntityId : IEquatable<IEntityId>, IComparable<IEntityId>
 ```csharp
 public sealed class ComponentRegistry : IComponentRegistry
 {
+    private readonly object _lock = new object();
     private readonly Dictionary<Type, int> _ids = new Dictionary<Type, int>();
+    private readonly Dictionary<int, Type> _types = new Dictionary<int, Type>();
     private int _nextId = 1;
 
     public int GetId(Type type)
     {
-        if (_ids.TryGetValue(type, out var id)) return id;
-        id = _nextId++;
-        _ids.Add(type, id);
-        return id;
+        lock (_lock)
+        {
+            if (_ids.TryGetValue(type, out var id)) return id;
+            id = _nextId++;
+            _ids.Add(type, id);
+            _types[id] = type;
+            return id;
+        }
+    }
+
+    public bool TryGetType(int typeId, out Type type)
+    {
+        lock (_lock) { return _types.TryGetValue(typeId, out type); }
     }
 }
 ```
@@ -199,7 +210,7 @@ Before installing systems, the composer enforces module governance: deduplicatio
 
 `SveltoWorldModule` registers all Svelto runtime objects as world-scoped singletons through `WorldContainerBuilder.TryRegister`:
 
-```
+```text
 SveltoWorldContext
   ├── EnginesRoot           (add engines, manage engine lifecycle)
   ├── EntitiesSubmissionScheduler  (batch and commit structural changes)

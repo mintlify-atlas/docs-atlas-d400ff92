@@ -170,12 +170,12 @@ The adapter layer is what allows the same input intent to flow into a local sync
 
     Concrete sinks: `DirectCallInputSink` (for local, no-network tests) and `RuntimePortInputSink` (for the full pipeline).
 
-    **Source:** `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/`
+    **Source:** `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/IO/IMobaBattleInputPort.cs`
   </Card>
   <Card title="Sink" icon="filter">
     **Where output goes.** A Sink consumes the output of the logic layer — presentation events, snapshots, view cues. `ViewEventSink`, `SnapshotDispatcher`, and `PresentationCue` are the main output consumers in the demo projects. The Console Demo's view layer reads from `ConsoleBattleView`, which subscribes to actor state snapshots.
 
-    **Source:** `src/AbilityKit.Demo.Moba.Console/Battle/Features/ConsoleViewFeature.cs`
+    **Source:** `src/AbilityKit.Demo.Moba.Console/Battle/Features/View/ConsoleViewFeature.cs`
   </Card>
   <Card title="Registry" icon="book">
     **ID-stable lookup tables.** Registries provide determinism-safe lookups for component types, functions, and actions. `ComponentRegistry` maps C# types to stable integer IDs. `FunctionRegistry` and `ActionRegistry` map string names to typed executors inside the Triggering system.

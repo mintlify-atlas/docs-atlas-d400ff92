@@ -1,7 +1,7 @@
 ---
 title: "Skill Pipeline: Orchestrating Multi-Phase Skill Flow"
 sidebarTitle: "Skill Pipeline"
-description: "How com.abilitykit.pipeline orchestrates skill execution through composable phase graphs — Sequence, Parallel, Conditional, Delay, Repeat, WaitUntil, and Timeline."
+description: "How com.abilitykit.pipeline drives skill execution through composable phase graphs: Sequence, Parallel, Conditional, Delay, Repeat, and Timeline."
 ---
 
 The Skill Pipeline answers one concrete question: **how is a skill's execution flow orchestrated across frames?** Rather than encoding a MOBA skill as a monolithic executor, AbilityKit represents each skill as a directed graph of phases that advance through time, pause on input, interrupt on cancellation, and compose into arbitrarily complex multi-stage abilities. The `com.abilitykit.pipeline` package provides those building blocks as pure C# types, independently testable and usable on servers, consoles, and editors alike.

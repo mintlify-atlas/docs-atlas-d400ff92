@@ -1,7 +1,7 @@
 ---
 title: "Triggering System: Event-Driven Gameplay Rule Execution"
 sidebarTitle: "Triggering"
-description: "How com.abilitykit.triggering answers 'when an event fires, which rules run and what actions execute' — from EventBus through TriggerRunner to ActionRegistry."
+description: "com.abilitykit.triggering: TriggerRunner sorts rules by Phase, Priority, and Order, evaluates predicates, and dispatches registered actions on each event."
 ---
 
 The Triggering system answers a single design question: **when an event occurs, which rules run and what actions execute?** It does not know about Buff stacks, projectile trajectories, or damage formulas. Instead it provides a formal, data-driven execution backbone: subscribe to events, sort multiple triggers by phase/priority/order, evaluate conditions, execute actions, handle interruption, schedule deferred work, and emit lifecycle notifications. Any gameplay module — active skills, passive buffs, projectile hits, area enter/exit, Timeline node callbacks — connects to combat services by routing events through this layer.

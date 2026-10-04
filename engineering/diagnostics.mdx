@@ -246,15 +246,17 @@ The `run_shooter_sync_allocation_gate.ps1` script enforces a hard budget on mana
 The `com.abilitykit.analyzer` package contributes a `RoslynAnalyzer` DLL that Unity loads during compilation. It enforces the three-layer boundary model — Framework Mechanism, Project Application, Host — without requiring any runtime overhead.
 
 ```csharp
-// Example diagnostic rule definition
-// Unity/Packages/com.abilitykit.analyzer/Runtime/AbilityKit.Analyzer/Core/AKDiagnostic.cs
+// Diagnostic ID constants
+// Unity/Packages/com.abilitykit.analyzer/DotNet~/AbilityKit.Analyzer/Config/DiagnosticIds.cs
 
 // Diagnostic IDs are stable identifiers referenced by suppressions:
-// AK0001 — Forbidden namespace reference
-// AK0002 — ConfigTableDefinition contract violation
+// AK1001 — Forbidden namespace reference
+// AK1002 — Forbidden assembly reference
+// AK1003 — Unmatched constraint package
+// AK1004 — PartialConfigTableFactory contract violation
 
 // Suppress on a specific site when the violation is intentional:
-[SuppressDiagnostic("AK0001")]
+[SuppressDiagnostic("AK1001")]
 private void LegacyBootstrapEntry() { ... }
 ```
 

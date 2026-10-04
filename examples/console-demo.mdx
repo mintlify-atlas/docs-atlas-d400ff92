@@ -24,7 +24,7 @@ The Console Demo's `FrameSyncAdapter`, `StateSyncAdapter`, and `HybridSyncAdapte
 
 The `ConsoleBattleBootstrapper` is the composition root. Calling `Initialize()` → `Start()` → `SetupBattle()` brings the process from startup to an active in-match state:
 
-```
+```text
 Program.Main
   └── ConsoleBattleBootstrapper
         ├── BattleStartConfig → BattleStartPlan + MobaBattleLaunchSpec
@@ -36,7 +36,7 @@ Program.Main
 
 `SetupBattle()` advances the phase flow directly to `InMatch`, which triggers `InMatchPhase` to attach all registered Features, spawn character entities, register the local player, and signal battle start.
 
-## The Four Core Features
+## The Five Core Features
 
 `InMatchPhase` mounts these Features via `FeatureHost` on every battle entry:
 
@@ -52,6 +52,9 @@ Program.Main
   </Card>
   <Card title="ConsoleViewFeature" icon="display">
     Drives the `IConsoleBattleView` lifecycle during `InMatch`. Works alongside `ConsoleBattleViewEventSink`, which translates Share-layer snapshot events (actor spawn, transform, damage, projectile, presentation cue) into console renderer calls.
+  </Card>
+  <Card title="ConsoleHudFeature" icon="window-maximize">
+    Maintains the Console HUD display and input-assist state during `InMatch`. Works with `ConsoleInputHandler` to surface the current skill-slot selection and movement state in the text-mode UI.
   </Card>
 </CardGroup>
 
@@ -71,7 +74,7 @@ The adapter does **not** advance the frame counter. Frame advancement happens in
 
 Each call to `ConsoleBattleBootstrapper.Tick(deltaTime)` executes in the following order:
 
-```
+```text
 1. Update total time and LastFrame
 2. BattleFlow.Tick  →  InMatch FeatureHost.Tick
 3. RuntimeWorld.Tick
@@ -87,7 +90,7 @@ Each call to `ConsoleBattleBootstrapper.Tick(deltaTime)` executes in the followi
 
 Input is split across two stages to keep the keyboard thread out of the game loop:
 
-```
+```text
 ConsoleInputHandler (background thread)
   └── Writes HUD state: HudMoveDx, HudMoveDz, HudSkillClickSlot
 

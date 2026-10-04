@@ -1,7 +1,7 @@
 ---
 title: "Ability Effects: GameplayEffect Lifecycle Management"
 sidebarTitle: "Ability Effects"
-description: "How com.abilitykit.ability manages GameplayEffect Apply/Step/Remove lifecycle — instant, duration, and periodic effects with Tag requirements and component extension points."
+description: "How com.abilitykit.ability manages GameplayEffect Apply, Step, and Remove for instant, duration, and periodic modes with Tag checks and component hooks."
 ---
 
 The `com.abilitykit.ability` package layers a **GameplayEffect lifecycle** on top of Triggering and the combat primitives. Where Triggering handles event-driven rule execution, the Ability package answers a different question: how does a persistent, time-bounded, or periodic capability get applied to an entity, tick over its lifetime, and then clean up when it expires or is removed? The answer is `GameplayEffectSpec` → `EffectInstance` → `EffectContainer`, a lifecycle model that is deliberately decoupled from any particular entity system, animation layer, or game genre.

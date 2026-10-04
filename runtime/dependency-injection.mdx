@@ -128,7 +128,7 @@ public interface IWorldDeinitializable
 
 When a scope or root container is disposed, instances are processed in **reverse creation order**: the most-recently-created instance is deinitialized and disposed first. This mirrors a dependency stack — services that depend on others are torn down before their dependencies.
 
-```
+```text
 Scope.Dispose():
   ↓ reverse over scoped instances
     OnDeinit(scope)
