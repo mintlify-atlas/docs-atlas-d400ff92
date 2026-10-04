@@ -1,0 +1,284 @@
+---
+title: "Flow & HFSM: Async Orchestration and State Machines"
+sidebarTitle: "Flow & HFSM"
+description: "Two complementary packages: com.abilitykit.flow for async node-tree orchestration, and com.abilitykit.hfsm for event-driven hierarchical state machines."
+---
+
+AbilityKit ships two complementary control-flow packages that answer different questions about game logic organization. `com.abilitykit.flow` answers *"how do I organize async, time-driven, and multi-step logic?"* — think skill cast sequences, UI animation chains, and multi-system coordination flows. `com.abilitykit.hfsm` answers *"what state is an entity currently in, and how should it transition between states?"* — think NPC AI, character stance machines, and boss phase controllers. The two are designed to work together: `HfsmFlowRunner` lets you embed an HFSM inside a Flow tree, so a Sequence node can own a state machine as one of its steps.
+
+<Tabs>
+  <Tab title="Flow Engine">
+    **Use when:** You need to express *temporal coordination* — wait for something to happen, branch on a condition, run two things in parallel, time out after N seconds, or clean up resources after a step completes.
+
+    **Core metaphor:** A tree of `IFlowNode` nodes driven forward by a `FlowRunner`. Each node has `Enter` / `Tick` / `Exit` / `Interrupt` callbacks. The runner calls `Step(deltaTime)` every logical tick. Nodes that need to wait for an external event set the flow into a WAIT state and then call `Wake()` when the event fires — this is the WAKE/PUMP mechanism.
+
+    **Typical uses:** Async skill cast sequences, UI transition choreography, loading steps with cancellation, waiting for multiple async operations to complete.
+  </Tab>
+  <Tab title="HFSM">
+    **Use when:** You need to express *state identity* — an entity is in exactly one state at a time, states have enter/exit behaviors, and transitions fire based on conditions or incoming events.
+
+    **Core metaphor:** A `StateMachine<TOwnId, TStateId, TEvent>` holds a current active state. Every tick calls `OnLogic` on the active state. `AddTransition` registers condition-based switches; `AddTriggerableTransition` registers event-driven switches via the `ITriggerable<TEvent>` interface.
+
+    **Typical uses:** NPC patrol → chase → attack → retreat, character idle/move/jump/stagger, boss phase 1 → phase 2 → enraged, ability active/cooldown/locked states.
+  </Tab>
+</Tabs>
+
+---
+
+## Flow Engine (`com.abilitykit.flow`)
+
+### IFlowNode — The Building Block
+
+Every Flow node implements four lifecycle methods:
+
+```csharp
+public interface IFlowNode
+{
+    void Enter(FlowContext ctx);
+    FlowStatus Tick(FlowContext ctx, float deltaTime);
+    void Exit(FlowContext ctx);
+    void Interrupt(FlowContext ctx);
+}
+```
+
+`Enter` runs once when the node becomes active. `Tick` is called every `Step(deltaTime)` while the node is running and returns `Running`, `Succeeded`, or `Failed`. `Exit` fires on natural completion. `Interrupt` fires when the owning runner cancels or replaces the tree mid-run.
+
+### Built-in Composite and Leaf Nodes
+
+| Node | Behavior |
+|---|---|
+| `SequenceNode` | Runs children left-to-right; stops and fails if any child fails |
+| `RaceNode` | Runs all children in parallel; the first to finish determines the result |
+| `ParallelAllNode` | Runs all children in parallel; succeeds only when all succeed |
+| `IfNode` | Evaluates a predicate; routes to the true or false branch |
+| `SwitchNode` | Multi-way conditional branch |
+| `TimeoutNode` | Wraps a child; interrupts it after a time limit |
+| `AwaitCompletionNode` | Pauses the flow until `FlowCompletion.Set()` is called externally |
+| `RunUntilCompletionNode` | Ticks an async task inside the flow until it completes |
+| `TickWhileNode` | Calls a callback every tick while a condition holds |
+| `UsingResourceNode` | RAII pattern — creates a resource, runs a sub-tree, then disposes |
+| `DoNode` | Leaf node that invokes a single callback |
+| `WaitSecondsNode` | Waits a fixed number of logical seconds |
+
+### FlowRunner — Step and Wake
+
+`FlowRunner` drives a node tree. It owns a `FlowContext` and a root `IFlowNode`. Calling `Start(root)` primes the tree with one initial `Step(0f)` so that `Enter` callbacks run and nodes can subscribe to events immediately:
+
+```csharp
+public sealed class FlowRunner : IDisposable
+{
+    public FlowContext Context { get; }
+    public FlowStatus Status { get; }
+
+    public void Start(IFlowNode root);
+    public FlowStatus Step(float deltaTime);
+    public void Stop();
+}
+```
+
+`Step(deltaTime)` advances the tree one frame. If a node is waiting for an external signal and that signal fires during the step (re-entrancy guard), `_wakeRequested` is set and the pump loop resolves it after the current step completes — preventing nested `Enter` calls on a tree that hasn't finished entering.
+
+### WAKE/PUMP — Waiting Without Blocking
+
+The WAKE/PUMP mechanism is how Flow avoids polling. A node registers interest in an external event, enters a waiting state, and calls `FlowWakeUp.Wake()` when the event fires. The runner then re-enters the pump loop and calls `Step(0f)` to advance past the wait point.
+
+```csharp
+var completion = new FlowCompletion();
+
+var root = Sequence(
+    AwaitCompletion(completion),       // pauses here
+    Do(() => Console.WriteLine("Resumed after external signal"))
+);
+
+runner.Start(root);
+
+// From an async callback or network handler:
+completion.Set();   // calls Wake() internally, resumes the flow
+```
+
+`AwaitCompletionNode` waits for a single `FlowCompletion.Set()` signal. `RunUntilCompletionNode` repeatedly ticks an async task object until it reports done. Both allow the logical simulation loop to keep advancing other systems at full frame rate while this particular flow pauses.
+
+### FlowContext — Scoped Type→Object Dictionary
+
+`FlowContext` is a `Dictionary<Type, object>` with lexical scoping via a stack. Nodes `Set<T>` values for downstream children to `Get<T>` without needing explicit parameters. `BeginScope()` returns an `IDisposable` — when it disposes, all entries registered during that scope are removed. This is the RAII pattern that `UsingResourceNode` uses to guarantee cleanup even when the flow is interrupted.
+
+```csharp
+public sealed class FlowContext
+{
+    public void Set<T>(T value) { ... }
+    public bool TryGet<T>(out T value) { ... }
+    public T Get<T>() { ... }           // throws if missing
+    public void Remove<T>() { ... }
+    public IDisposable BeginScope() { ... }
+}
+```
+
+### HfsmFlowRunner — Embedding HFSM inside Flow
+
+`HfsmFlowRunner` is an adapter that wraps an HFSM as an `IFlowNode`. This lets a `Sequence` or `Parallel` node manage a state machine as one of its steps — for example, running an NPC's `ChasePhase` state machine until it reports success, then moving on to an `AttackPhase` node.
+
+<Tip>
+  Use `HfsmFlowRunner` when a state machine needs to exist for a bounded duration (e.g., only during one skill cast or one encounter phase). Use a standalone `StateMachine` when the state machine lives for the entire entity lifetime.
+</Tip>
+
+---
+
+## HFSM (`com.abilitykit.hfsm`)
+
+### StateMachine and State Registration
+
+`StateMachine<TOwnId, TStateId, TEvent>` is the root object. States are added with `AddState`, and transitions connect them:
+
+```csharp
+var fsm = new StateMachine<string, string, string>(ownerId: "NPC_001");
+
+fsm.AddState("Patrol", new State(
+    onEnter: () => BeginPatrolRoute(),
+    onLogic: dt => FollowPatrolRoute(dt),
+    onExit: () => StopMovement()
+));
+
+fsm.AddState("Chase", new State(
+    onEnter: () => LockOnTarget(target),
+    onLogic: dt => MoveToward(target, dt)
+));
+
+fsm.AddState("Attack", new State(
+    onEnter: () => PlayAttackAnimation()
+));
+
+// Condition-based transitions:
+fsm.AddTransition("Patrol", "Chase", new Transition(t => DistanceTo(target) < chaseRange));
+fsm.AddTransition("Chase", "Attack", new Transition(t => DistanceTo(target) < attackRange));
+
+// Time-delayed transition (return to patrol after 3 seconds of attacking):
+fsm.AddTransition("Attack", "Patrol", new TransitionAfter("Attack", "Patrol", delay: 3.0f));
+
+// Event-driven transition (take damage → enter Hurt regardless of current state):
+fsm.AddTriggerableTransition("TakeDamage", new Transition(from: "any", to: "Hurt"));
+
+fsm.SetStartState("Patrol");
+fsm.Init();
+```
+
+Every tick, the host system calls `fsm.OnLogic(deltaTime)`. The state machine evaluates outgoing transitions from the active state; if one's `ShouldTransition()` returns true, the machine calls the active state's `OnExit`, the transition's `BeforeTransition` / `AfterTransition` hooks, and the target state's `OnEnter`.
+
+### ITriggerable — Event-Driven Transitions
+
+```csharp
+public interface ITriggerable<TEvent>
+{
+    void Trigger(TEvent trigger);
+}
+```
+
+`StateMachine` implements `ITriggerable<TEvent>`. Call `fsm.Trigger("Hit")` from any system or callback to immediately evaluate all trigger-registered transitions for the `"Hit"` event against the current state. This is how "receive damage → switch to hurt state" works without polling a condition every frame.
+
+### IAction and BehaviorStatus — Behavior Tree Integration
+
+States can execute `IAction` instances that return a `BehaviorStatus`:
+
+```csharp
+public interface IAction
+{
+    string Name { get; set; }
+    BehaviorStatus Execute(BehaviorContext context); // Running / Success / Failure
+    void Reset();
+    void ForceEnd();
+}
+
+public enum BehaviorStatus { Running, Success, Failure }
+```
+
+Built-in composite actions mirror behavior tree patterns: `SequenceAction` (run in order, fail on first failure), `SelectorAction` (run in order, succeed on first success), `WaitAction`, and `RepeatAction`. This lets you express "while in the Attack state, first play the wind-up animation (Running), then deal damage (Success), then return to Idle" without a separate system.
+
+### DecoratedState — AOP Hooks
+
+`DecoratedState` wraps any `StateBase` with optional before/after callbacks for each lifecycle method. It does not affect the wrapped state's timing or transition behavior:
+
+```csharp
+public class DecoratedState<TStateId, TEvent> : StateBase<TStateId>, ITriggerable<TEvent>
+{
+    private readonly Action<StateBase<TStateId>> beforeOnEnter, afterOnEnter;
+    private readonly Action<StateBase<TStateId>> beforeOnLogic, afterOnLogic;
+    private readonly Action<StateBase<TStateId>> beforeOnExit,  afterOnExit;
+
+    public override void OnEnter()
+    {
+        beforeOnEnter?.Invoke(this);
+        state.OnEnter();
+        afterOnEnter?.Invoke(this);
+    }
+    // ... same pattern for OnLogic and OnExit
+}
+```
+
+Use `DecoratedState` for cross-cutting concerns — logging state entries, recording metrics, emitting debug events — without modifying the state's own logic.
+
+### TransitionAfter — Time-Delayed Transitions
+
+`TransitionAfter` adds a minimum elapsed time before a transition is eligible to fire. An optional additional condition predicate is evaluated only after the delay has passed:
+
+```csharp
+public class TransitionAfter<TStateId> : TransitionBase<TStateId>
+{
+    public float delay;
+    public ITimer timer;
+
+    public override bool ShouldTransition()
+    {
+        if (timer.Elapsed < delay) return false;
+        if (condition == null) return true;
+        return condition(this);
+    }
+}
+```
+
+This is the canonical way to express "stay in this state for at least N seconds" without any extra timer fields on the state itself.
+
+### Use Cases
+
+<CardGroup cols={2}>
+  <Card title="NPC AI" icon="robot">
+    Patrol → Chase → Attack → Retreat. Use `Transition` for proximity conditions and `ITriggerable` for damage events that forcibly interrupt the current state.
+  </Card>
+  <Card title="Character State Machine" icon="person-running">
+    Idle / Move / Jump / Fall / Stagger. Use `TransitionAfter` for minimum state durations (e.g., stagger cannot be interrupted for 0.3 s).
+  </Card>
+  <Card title="Boss Phase Transitions" icon="dragon">
+    Phase 1 → Phase 2 at 50% HP, Phase 2 → Enraged at 20% HP. Trigger-based transitions fire the moment the HP threshold event is emitted from the damage system.
+  </Card>
+  <Card title="Ability State Tracking" icon="wand-magic-sparkles">
+    Ready → Casting → Cooldown → Ready. DecoratedState hooks emit telemetry events at each transition for the diagnostics and replay systems.
+  </Card>
+</CardGroup>
+
+---
+
+## Flow and HFSM Together
+
+The two packages are designed to complement each other at the boundaries where pure state machines become awkward:
+
+- **HFSM inside Flow**: Wrap a `StateMachine` in `HfsmFlowRunner` to treat a state machine as a Flow step. A Sequence can run the machine until it signals completion, then continue to the next node.
+- **Flow inside an HFSM state**: An HFSM state's `OnLogic` can call `flowRunner.Step(deltaTime)` to advance a sub-flow. This is useful when a single "Attack" state actually involves a multi-step sequence (wind-up → strike → recovery) that is too complex for a single callback.
+- **Parallel execution**: `ParallelAllNode` can run both an HFSM-backed flow and a timeout flow simultaneously, so if the state machine doesn't finish in time, the timeout node cancels it.
+
+<Info>
+  `HfsmFlowRunner` is documented in both package READMEs as the integration adapter but is currently described in package documentation. Check the Flow package samples (`com.abilitykit.flow/Samples~/`) for working integration examples.
+</Info>
+
+## Source Reading Path
+
+**Flow:**
+1. `IFlowNode.cs` — four lifecycle methods.
+2. `FlowRunner.cs` — `Step`, `Wake`, `Pump`, and re-entrancy guard.
+3. `FlowContext.cs` — scoped type-keyed dictionary.
+4. `AwaitCompletionNode.cs` and `RunUntilCompletionNode.cs` — WAKE/PUMP usage.
+5. `FlowCompletion.cs` — the external signal object.
+
+**HFSM:**
+1. `StateMachine.cs` — `AddState`, `AddTransition`, `AddTriggerableTransition`, `OnLogic`.
+2. `ITriggerable.cs` — event-driven trigger interface.
+3. `TransitionAfter.cs` — timer-gated transition.
+4. `DecoratedState.cs` — AOP wrapper.
+5. `IAction.cs` and `BehaviorStatus.cs` — behavior tree action layer.

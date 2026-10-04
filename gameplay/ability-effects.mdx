@@ -1,0 +1,158 @@
+---
+title: "Ability Effects: GameplayEffect Lifecycle Management"
+sidebarTitle: "Ability Effects"
+description: "How com.abilitykit.ability manages GameplayEffect Apply/Step/Remove lifecycle — instant, duration, and periodic effects with Tag requirements and component extension points."
+---
+
+The `com.abilitykit.ability` package layers a **GameplayEffect lifecycle** on top of Triggering and the combat primitives. Where Triggering handles event-driven rule execution, the Ability package answers a different question: how does a persistent, time-bounded, or periodic capability get applied to an entity, tick over its lifetime, and then clean up when it expires or is removed? The answer is `GameplayEffectSpec` → `EffectInstance` → `EffectContainer`, a lifecycle model that is deliberately decoupled from any particular entity system, animation layer, or game genre.
+
+## Package
+
+`com.abilitykit.ability`
+
+## Core Types
+
+<CardGroup cols={2}>
+  <Card title="EffectService" icon="server">
+    The outward-facing entry point. Publishes effect lifecycle events and provides one-shot evaluate/execute calls for effects that do not require a container.
+    
+    Source: `Runtime/Ability/Effect/EffectService.cs`
+  </Card>
+  <Card title="EffectContainer" icon="box">
+    Manages the active effect list for a single entity. Owns Apply, Step, and Remove. All three operations are routed through this class.
+    
+    Source: `Runtime/Ability/Effect/EffectContainer.cs`
+  </Card>
+  <Card title="GameplayEffectSpec" icon="file-lines">
+    Read-only configuration for an effect: duration seconds, period seconds, Tag requirements, granted tags, component list, and Cue references.
+    
+    Source: `Runtime/Ability/Effect/GameplayEffectSpec.cs`
+  </Card>
+  <Card title="EffectInstance" icon="circle-dot">
+    Runtime state for one active application of a spec: elapsed time, remaining seconds, next tick time, active flag, and instance ID.
+    
+    Source: `Runtime/Ability/Effect/EffectInstance.cs`
+  </Card>
+  <Card title="IEffectComponent" icon="puzzle-piece">
+    Extension point interface. Each component on a `GameplayEffectSpec` receives `OnApply`, `OnTick`, and `OnRemove` callbacks.
+    
+    Source: `Runtime/Ability/Effect/IEffectComponent.cs`
+  </Card>
+  <Card title="IGameplayEffectCue" icon="bell">
+    Presentation side-channel. Receives `OnActive`, `WhileActive`, and `OnRemove` notifications independently of game logic.
+  </Card>
+</CardGroup>
+
+## Apply / Step / Remove Lifecycle
+
+<Steps>
+  <Step title="ApplicationRequirements check">
+    `EffectContainer.Apply(spec, context)` first evaluates the spec's Tag requirements against the target's current tag state. If `ApplicationRequirements` are not met — because a required tag is absent or a blocked tag is present — Apply returns `null` immediately without creating an instance. No event is published.
+  </Step>
+  <Step title="Create EffectInstance">
+    A new `EffectInstance` is created with the spec's duration, period, and a unique instance ID. The instance is added to the `_active` list.
+  </Step>
+  <Step title="Publish Apply TriggerEvent">
+    `EffectService` publishes the Apply event onto the `IEventBus`. Any `TriggerRunner` subscription to that event key will execute in this same call stack unless deferred by `ActionSchedulerManager`.
+  </Step>
+  <Step title="Grant Tags">
+    The spec's `GrantedTags` are added to the target entity's tag container via `IGameplayTagService`, making them available for other effects' requirement checks immediately.
+  </Step>
+  <Step title="Component OnApply">
+    Each `IEffectComponent` in the spec has `OnApply(instance, context)` called in declaration order. Components handle attribute modification, secondary effect spawning, and other initialization side-effects.
+  </Step>
+  <Step title="Cue activation">
+    `IGameplayEffectCue.OnActive` is called for all attached cues. The visual/audio layer can begin its presentation.
+  </Step>
+  <Step title="Instant check or first tick">
+    If the spec has no duration (instant effect), `Remove` is called immediately. If `ExecutePeriodicOnApply` is true, the first tick fires before the container waits for the period. Otherwise `NextTickInSeconds` is set to the period interval.
+  </Step>
+  <Step title="Step (per-frame)">
+    `EffectContainer.Step(context, deltaTime)` advances all active instances. `ElapsedSeconds` increments, `Cue.WhileActive` fires, remaining duration decrements, and when `NextTickInSeconds` is reached, a Tick event is published and each component's `OnTick` is called. Instances at zero remaining seconds proceed to Remove.
+  </Step>
+  <Step title="Remove">
+    The instance is removed from `_active`. A Remove TriggerEvent is published. `Cue.OnRemove` and then each component's `OnRemove` fire in order. Finally, the granted tags are withdrawn from the target's tag container.
+  </Step>
+</Steps>
+
+## Effect Duration Modes
+
+| Mode | Duration | Period | Behaviour |
+|------|----------|--------|-----------|
+| **Instant** | None / zero | — | Apply fires and Remove fires in the same call. Used for one-shot stat changes, spawning events. |
+| **Duration** | Positive seconds | None | Stays active for a fixed time; ticks only if period is set. |
+| **Periodic** | Positive seconds (or infinite) | Positive seconds | Ticks every `PeriodSeconds` while active. Used for damage-over-time, heal-over-time, and interval-based buffs. |
+| **Infinite** | No expiry | Optional period | Active until explicitly removed. Useful for equip-style modifiers and persistent auras. |
+
+## IEffectComponent Extension Point
+
+Components are the primary extension mechanism. Each component is a stateless or lightly-stateful object declared in the spec that receives lifecycle callbacks.
+
+```csharp
+// Source: com.abilitykit.ability
+// Runtime/Ability/Effect/IEffectComponent.cs
+
+public interface IEffectComponent
+{
+    void OnApply(EffectInstance instance, IEffectContext context);
+    void OnTick(EffectInstance instance, IEffectContext context);
+    void OnRemove(EffectInstance instance, IEffectContext context);
+}
+```
+
+Typical component responsibilities:
+
+- **Attribute modifier component**: Adds a `ModifierData` to the target's `AttributeGroup` on Apply; removes it on Remove.
+- **Projectile component**: Spawns a projectile on Apply via `ProjectileService`.
+- **Tag grant component**: Grants additional tags beyond the spec's static `GrantedTags`.
+- **Secondary effect component**: Applies a child `GameplayEffectSpec` on Apply or on each Tick.
+
+## Tag Requirements and Granted Tags
+
+```csharp
+// GameplayEffectSpec fields relevant to tag interaction:
+//   ApplicationRequirements — GameplayTagRequirements checked before Apply
+//   GrantedTags            — GameplayTagContainer added on Apply, removed on Remove
+```
+
+`ApplicationRequirements` uses `GameplayTagRequirements` (Required-All / Blocked-Any). The check happens before instance creation, so tag state is never in an inconsistent mid-apply state. `GrantedTags` are part of the effect's identity: they are visible immediately after Apply and disappear immediately after Remove.
+
+<Note>
+Tag requirements run against the **target's current tag container** at the moment Apply is called. If the target gains or loses a blocking tag while the effect is active, the running instance is not automatically removed — removal based on ongoing tag state must be implemented by the project layer (for example, in a reconcile system similar to the MOBA `BuffLifecycleReconcileSystem`).
+</Note>
+
+## Default TriggerEvents
+
+Every phase of the lifecycle publishes a `TriggerEvent` onto the `IEventBus` automatically:
+
+| Lifecycle phase | Default event |
+|----------------|---------------|
+| Apply | `EffectService.ApplyEvent` |
+| Tick | `EffectService.TickEvent` |
+| Remove | `EffectService.RemoveEvent` |
+
+These events allow other `TriggerRunner` subscriptions to react to effect transitions without tight coupling. For example, a passive skill might trigger additional damage whenever a specific effect type ticks on a target.
+
+## Disabling Default Triggers
+
+In tests or specialised runtime contexts where the default event chain would cause unwanted recursion or noise, `IEffectTriggeringSwitch` lets you disable default trigger publishing for a given execution scope:
+
+```csharp
+// Source: com.abilitykit.ability
+// Runtime/Ability/Effect/IEffectTriggeringSwitch.cs
+
+public interface IEffectTriggeringSwitch
+{
+    bool IsEffectTriggeringEnabled { get; }
+}
+```
+
+When the context implements `IEffectTriggeringSwitch` and `IsEffectTriggeringEnabled` is `false`, the container skips publishing Apply, Tick, and Remove events for that call.
+
+## Application-Layer Note
+
+<Warning>
+`MobaBuffService`, `MobaContinuousManager`, hero skill logic, and the MOBA Buff stacking/refresh policies are **application-layer implementations**, not public framework API. They demonstrate how to build a domain-specific Buff system on top of `EffectContainer`, `IEffectComponent`, and `IContinuous`, but their class names and fields are not stable public contracts.
+
+Other projects should compose their own Buff, Aura, and Passive systems from the same framework primitives with project-appropriate lifecycle rules.
+</Warning>

@@ -1,0 +1,263 @@
+---
+title: "Diagnostics, Tracing, and Static Analysis in AbilityKit"
+sidebarTitle: "Diagnostics"
+description: "Runtime observability: diagnostics package, ability explain, trace lineage, pipeline hooks, record snapshots, allocation governance, and Roslyn analyzer."
+---
+
+AbilityKit treats runtime observability as a first-class design concern, not an afterthought. Gameplay modules — skills, buffs, projectiles, and damage — record structured lineage data as they execute. The pipeline emits hook events that editors and test frameworks can subscribe to. The diagnostics package aggregates profiler samples, trace sections, and battle metrics into a stable JSON artifact that tools, CI, and developers can read without interpreting log strings. These layers are designed to remain zero-cost at runtime when disabled and to produce reproducible, machine-readable evidence when enabled.
+
+## Package Overview
+
+<CardGroup cols={2}>
+  <Card title="com.abilitykit.diagnostics" icon="chart-bar">
+    Core runtime observability package. Provides `IProfiler`, `ProfilerHub`, `EditorProfiler`, the `DiagnosticsWindow` Unity Editor window, structured `AbilityKitAnalysisArtifact` export, and `AnalysisArtifactJsonExporter`. The artifact schema is `abilitykit-analysis.v1`.
+
+    **Source:** `Unity/Packages/com.abilitykit.diagnostics/`
+  </Card>
+  <Card title="com.abilitykit.ability.explain" icon="magnifying-glass">
+    Skill explanation and debug framework. Exposes an `ExplainForest` / `ExplainNode` model, a navigation protocol (`NavigationTarget`), diff support (`ExplainForestDiff`), and a Unity Editor window (`AbilityExplainContextEditorWindow`) for inspecting live skill runtime state.
+
+    **Source:** `Unity/Packages/com.abilitykit.ability.explain/`
+  </Card>
+  <Card title="com.abilitykit.trace" icon="diagram-project">
+    Lineage context tracking. `TraceTreeRegistry<TMetadata>` maintains a forest of trace nodes keyed by `rootId`. Each node records its `TraceNodeKind`, parent, source, frame, and optional leaf data. `ITraceContextSource` extracts stable IDs from gameplay objects.
+
+    **Source:** `Unity/Packages/com.abilitykit.trace/`
+  </Card>
+  <Card title="Pipeline Trace & DebugHooks" icon="code-branch">
+    `IPipelineTraceRecorder` captures per-run, per-phase trace events in a ring buffer. `PipelineDebugHooks` exposes `OnRunStarted`, `OnTrace`, and `OnRunEnded` static events that editors subscribe to without modifying runtime code.
+
+    **Source:** `Unity/Packages/com.abilitykit.pipeline/Runtime/Debug/`
+  </Card>
+  <Card title="com.abilitykit.record Integration" icon="database">
+    The `com.abilitykit.record` package records input-logic replay data and state-hash snapshots. Smoke tests verify that replay files are non-empty and validate them via frame-level re-execution. State hashes serve as determinism probes across frames and clients.
+
+    **Source:** Referenced by Shooter smoke artifact assertions.
+  </Card>
+  <Card title="com.abilitykit.analyzer" icon="shield-check">
+    Roslyn analyzer enforcing architectural boundaries at compile time. `ForbiddenNamespaceAnalyzer` blocks illegal cross-layer references; `ConfigTableDefinitionAnalyzer` validates table registration contracts. Constraint rules are JSON-configured and editable via the Unity Editor.
+
+    **Source:** `Unity/Packages/com.abilitykit.analyzer/`
+  </Card>
+</CardGroup>
+
+## The Diagnostics Package
+
+The `com.abilitykit.diagnostics` package provides a lightweight runtime profiling abstraction and a structured artifact export system. The `IProfiler` interface keeps hot-path code free of conditional `#if UNITY_EDITOR` guards: the `NullProfiler` no-ops all calls in production, while `EditorProfiler` records samples into an in-memory ring buffer.
+
+```csharp
+// Unity/Packages/com.abilitykit.diagnostics/Runtime/Core/IProfiler.cs
+
+public interface IProfiler
+{
+    bool IsEnabled { get; }
+
+    // Scope-based timing — call ToScope() to get an IDisposable
+    ProbeToken Begin(string name);
+    void Complete(ProbeToken token);
+
+    // Explicit measurement (nanoseconds already measured externally)
+    void Record(string name, long nanoseconds);
+
+    // Counters and gauges
+    void Increment(string counter);
+    void Add(string counter, long value);
+    void SetGauge(string name, long value);
+    void Sample(string name, double value);
+}
+
+// Preferred usage: using a scope that auto-completes on Dispose
+using (profiler.Sample("skill.cast.pipeline"))
+{
+    pipeline.Start(context);
+}
+```
+
+The `DiagnosticsWindow` Unity Editor window (`Window → AbilityKit → Diagnostics`) provides tabs for Overview, Metrics, Counters, Rates, Gauges, Durations, Samples, Events, and a Flame view. It reads live data from `ProfilerHub.GetEditorProfiler()` and can export sessions to JSON using `AnalysisArtifactJsonExporter`.
+
+The exported artifact root type is `AbilityKitAnalysisArtifact` with schema version `abilitykit-analysis.v1`. It contains stable sections for session metadata, time axis, profiler data, trace nodes, battle diagnostics, runtime stats, insights, threshold profile, and baseline comparison. Because the schema is versioned, tools and CI scripts can parse it without coupling to implementation details.
+
+## Ability Explain Framework
+
+The `com.abilitykit.ability.explain` package provides an IDE-style navigation protocol for inspecting active skill runtimes during development.
+
+<Note>
+The `explain` framework provides a **navigation protocol** for IDE-style inspection of active skill runtimes — useful for live debugging during development. `NavigationTarget` identifies a node or entity in the explain forest; `IExplainResolver` resolves an `ExplainResolveRequest` into an `ExplainResolveResult` containing the forest and optional timeline. The Editor window (`AbilityExplainContextEditorWindow`) renders this as a navigable tree with diff highlighting via `ExplainForestDiff`.
+</Note>
+
+The runtime model is built around three types:
+
+- **`ExplainForest`** — the snapshot of all currently active skill-related nodes as a forest of `ExplainNode` values. Each node carries an `ExplainNodeId`, severity (`ExplainSeverity`), an optional timeline (`ExplainTimeline`), and zero or more child nodes.
+- **`ExplainNode`** — a single point of information about one phase, phase group, or active run within the skill pipeline. It can represent a condition check result, phase execution, or a pending timeline action.
+- **Navigation Protocol** — `NavigationTarget` identifies a specific node; `IExplainResolver.Resolve(request, context)` fetches the current forest from the live runtime without requiring a breakpoint or frame capture.
+
+Providers register themselves through `AbilityExplainRegistry`, allowing different package layers to contribute nodes to the same forest view. The `ExplainTimelineDetailsSectionProvider` contributes timeline entries; additional section providers can be added per project.
+
+## Trace Lineage with com.abilitykit.trace
+
+The `com.abilitykit.trace` package gives every gameplay effect a chain of custody: a projectile knows which skill cast it, that cast knows which player triggered it, and that player record can be traced back to a match session. This lineage is stored in `TraceTreeRegistry<TMetadata>` as a forest of long-lived root nodes with short-lived child nodes.
+
+The core interfaces are designed for extensibility: `TraceNodeKind` and `TraceEndReason` are `byte` enums that business layers extend with their own values. `ITraceContextSource` extracts a stable `long` trace ID and display name from any gameplay object.
+
+```csharp
+// Unity/Packages/com.abilitykit.trace/Runtime/TraceInterfaces.cs
+
+// Implement to define how your gameplay objects provide trace IDs
+public interface ITraceContextSource
+{
+    bool TryExtractTraceId(
+        object origin,
+        out long traceableId,
+        out string displayName);
+}
+
+// Root state snapshot — poll during frame processing
+public readonly struct RootState
+{
+    public readonly long RootId;
+    public readonly int  ActiveCount;
+    public readonly int  ExternalRefCount;
+    public readonly int  LastTouchedFrame;
+}
+
+// Summary statistics for a root's entire node tree
+public readonly struct RootStats
+{
+    public readonly long RootId;
+    public readonly int  TotalNodes;
+    public readonly int  ActiveNodes;
+    public readonly int  EndedNodes;
+    public readonly int  MaxDepth;
+}
+```
+
+The `TraceTreeWindow` Unity Editor window renders the forest as a navigable tree. `NodeDetailPlugin` and `TreeVisualizationPlugin` provide extensible detail panels for custom node types.
+
+## MobaTraceRegistry Pattern
+
+`MobaTraceRegistry` is the MOBA application layer's adapter between the generic `TraceTreeRegistry<MobaTraceMetadata>` and the rest of the combat system. It is registered as a `WorldService`, injected automatically into systems that need trace context, and subscribes to `MobaExecutionContextRegistry` to track which execution contexts are currently active.
+
+```csharp
+// Unity/Packages/com.abilitykit.demo.moba.trace.adapter/Runtime/MobaTraceRegistry.cs
+
+[WorldService(typeof(MobaTraceRegistry))]
+[WorldService(typeof(IMobaOptionalHealthContributor))]
+public sealed class MobaTraceRegistry
+    : TraceTreeRegistry<MobaTraceMetadata>,
+      IService,
+      IWorldInitializable,
+      IWorldDeinitializable,
+      IMobaOptionalHealthContributor
+{
+    public MobaTraceRegistry()
+        : base(new DictionaryTraceMetadataStore<MobaTraceMetadata>())
+    {
+        RegistryEvent += OnRegistryEvent;
+    }
+
+    public void OnInit(IWorldResolver services)
+    {
+        if (services.TryResolve(out MobaExecutionContextRegistry contexts))
+            AttachExecutionContexts(contexts);
+    }
+
+    // ...
+}
+```
+
+`MobaActionExecutionSnapshotStore` and `MobaEffectExecutionSnapshotStore` listen to `TraceRegistryEvent` values (`NodeEnded`, `RootPurged`, `PredictionRetracted`, `RegistryCleared`) and build rolling snapshot buffers for the diagnostics export pipeline. These are optional adapters — the core trace registry has no dependency on MOBA-specific types.
+
+## Pipeline Trace Recorder
+
+`IPipelineTraceRecorder` and `PipelineDebugHooks` give you two complementary views into pipeline execution: an always-available hook system for editor tooling, and an injectable recorder interface for test scaffolding.
+
+```csharp
+// Unity/Packages/com.abilitykit.pipeline/Runtime/Interface/IPipelineTraceRecorder.cs
+
+public interface IPipelineTraceRecorder
+{
+    bool IsEnabled { get; }
+
+    // Called by the pipeline runtime whenever a trace event fires
+    void Record(IPipelineLifeOwner owner, PipelineTraceData data);
+
+    // Retrieve trace for a specific pipeline owner (ring-buffer backed)
+    IPipelineRunTrace? GetTrace(int ownerId);
+
+    // Snapshot the current trace events for a given owner
+    IReadOnlyList<PipelineTraceEvent> GetSnapshot(int ownerId);
+}
+```
+
+To observe pipeline execution in a test or debug session, inject a recorder and subscribe to the static hooks:
+
+```csharp
+// Register a custom recorder (e.g., in a test fixture setup)
+Pipeline.SetTraceRecorder(myRecorder);
+
+// Subscribe to hooks for editor-side tooling
+PipelineDebugHooks.OnRunStarted += (owner, pipeline, run) =>
+{
+    Debug.Log($"Run started: owner={owner}, pipeline={pipeline}");
+};
+
+PipelineDebugHooks.OnTrace += (owner, traceData) =>
+{
+    // traceData.PhaseId, traceData.State, traceData.Message
+    Debug.Log($"  [{traceData.PhaseId}] {traceData.State}: {traceData.Message}");
+};
+
+PipelineDebugHooks.OnRunEnded += data =>
+{
+    IReadOnlyList<PipelineTraceEvent> events =
+        Pipeline.TraceRecorder.GetSnapshot(data.Owner.OwnerId);
+    // Iterate events for assertion or export
+};
+```
+
+`NoOpPipelineTraceRecorder` is the production default — it implements `IPipelineTraceRecorder` with zero-cost stubs so shipping builds pay nothing for the instrumentation surface.
+
+## Record and State Hash Integration
+
+The `com.abilitykit.record` package records the input-logic replay stream as binary `FrameRecord` data. Smoke tests assert on both the replay file's existence and its content:
+
+- The Shooter Orleans smoke verifies `artifacts/shooter_smoke/records/input-logic.record.bin` is non-empty and that `InputLogicReplayValidation` succeeds.
+- The minimized replay (`input-logic.min.record.bin`) is validated separately to confirm the reduction algorithm preserved deterministic replay.
+- State hashes (`StateHash` fields in smoke result artifacts) are sampled per-frame and compared across clients to detect any non-determinism introduced by refactoring.
+
+These artifacts are produced during normal smoke runs and uploaded to CI artifact storage with `if: always()` guards, making them available for post-run analysis even on failure.
+
+## GC and Allocation Governance
+
+Hot-path allocation discipline is enforced by a combination of static analysis, benchmark gates, and design constraints. The core principles are:
+
+- **Index-based queries** rather than heap-allocated intermediate collections. `Targeting.StreamingTopK` operates on pre-warmed object-pooled candidate arrays, achieving zero current-thread managed allocation per query in steady state.
+- **Object pools** for pipeline runs, trigger controls, projectile instances, and area-of-effect regions. Pool `rent`, `miss`, `expand`, and `return` counts are tracked in the diagnostics profiler to detect capacity misconfigurations.
+- **Ring-buffer event dispatch** in `EventDispatcher` avoids per-event heap pressure when subscriber count is fixed; the diagnostics benchmark measures `0 B per handler-invocation` for the fixed-subscription integer-ID path.
+
+The `run_shooter_sync_allocation_gate.ps1` script enforces a hard budget on managed allocation during Shooter state-sync serialisation. The `run_shooter_aoi_lod_gate.ps1` script enforces CPU and allocation thresholds for AOI/LOD processing at a given entity count. Both exit non-zero on any breach, making them CI-blockable gates.
+
+<Warning>
+"Zero allocation" claims must be scoped to a specific measurement window, entity count, pool-warm state, and thread. The diagnostics benchmarks use `GC.GetAllocatedBytesForCurrentThread()` to measure the current thread's managed allocation within the measurement region — this does not cover other threads, native memory, or GPU memory. Always qualify allocation claims with their measurement context.
+</Warning>
+
+## Roslyn Analyzer
+
+The `com.abilitykit.analyzer` package contributes a `RoslynAnalyzer` DLL that Unity loads during compilation. It enforces the three-layer boundary model — Framework Mechanism, Project Application, Host — without requiring any runtime overhead.
+
+```csharp
+// Example diagnostic rule definition
+// Unity/Packages/com.abilitykit.analyzer/Runtime/AbilityKit.Analyzer/Core/AKDiagnostic.cs
+
+// Diagnostic IDs are stable identifiers referenced by suppressions:
+// AK0001 — Forbidden namespace reference
+// AK0002 — ConfigTableDefinition contract violation
+
+// Suppress on a specific site when the violation is intentional:
+[SuppressDiagnostic("AK0001")]
+private void LegacyBootstrapEntry() { ... }
+```
+
+Constraint rules are declared in JSON files and loaded by `ConstraintLoader`. The rules specify which namespaces are allowed to reference which other namespaces, what naming conventions apply to public types, and which config table attribute patterns are valid. The **Window → AbilityKit → Constraint Settings** editor window lets you inspect and update the active rule set without editing JSON directly.
+
+`NamespaceConstraintBuildChecker` runs the same constraint checks during `AssetPostprocessor` callbacks, surfacing violations in the Unity Console as compiler errors rather than requiring a full rebuild cycle.

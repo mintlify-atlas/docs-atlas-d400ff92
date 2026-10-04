@@ -1,0 +1,153 @@
+---
+title: "State Sync: Authoritative Snapshots and Client Prediction"
+sidebarTitle: "State Sync"
+description: "AbilityKit state sync: FrameSnapshotDispatcher routing, WorldStateSnapshot, SnapshotBuffer, PredictionCoordinator, and the Shooter dual-connection setup."
+---
+
+State synchronization in AbilityKit means the server periodically pushes authoritative entity state to clients — rather than replicating deterministic inputs and expecting identical local simulations. Clients predict locally, then reconcile when authoritative snapshots arrive. The Shooter demo is the primary reference for this mode, using an independent battle data transport alongside the Room Gateway control connection, with packed snapshots carrying full entity state for correction.
+
+## Relevant Packages
+
+- **`com.abilitykit.world.statesync`** — `WorldStateSnapshot`, `SnapshotBuffer`, `PredictionCoordinator`, `StateSlots`, `StateHashMessage`, `SnapshotMessage`
+- **`com.abilitykit.world.snapshot`** — `FrameSnapshotDispatcher`, snapshot pipeline and routing
+
+## State Sync vs. Frame Sync
+
+| Dimension | Frame Sync | State Sync |
+|---|---|---|
+| Server confirms | Input batch + optional state hash per frame | Authoritative entity state at regular snapshot intervals |
+| Client stores | Frame-end world snapshots for rollback | Pending local commands + predicted state; remote entities hold interpolation samples |
+| Divergence recovery | Restore `S(F-1)`, replay with authoritative inputs | Apply authoritative state `A(F)`, trim confirmed commands, replay remaining local inputs |
+| Determinism requirement | All endpoints must produce identical outputs from identical inputs | Not required — server is authoritative per entity per snapshot |
+| Snapshot frequency | Snapshots are optional per-frame calibration data | Snapshots are the primary correctness mechanism |
+
+## `FrameSnapshotDispatcher`: opCode-Based Routing
+
+`FrameSnapshotDispatcher` is the central routing hub for incoming snapshot envelopes. It decodes each `WorldStateSnapshot` by its `opCode` field and dispatches to typed handlers. This keeps the transport layer protocol-neutral: transports produce `ISnapshotEnvelope` objects (which `FramePacket` already implements), and the dispatcher handles the rest.
+
+```csharp
+public sealed class FrameSnapshotDispatcher : IDisposable, ISnapshotDecoderRegistry, ISnapshotDispatcher
+{
+    private readonly Dictionary<int, IRoute> _routes = new Dictionary<int, IRoute>();
+
+    public void Register<T>(int opCode, TryDecode<T> decoder) { /* ... */ }
+
+    public IDisposable Subscribe<T>(int opCode, Action<ISnapshotEnvelope, T> handler) { /* ... */ }
+
+    public void Feed(ISnapshotEnvelope envelope) { /* ... */ }
+}
+```
+
+When `Feed(envelope)` is called, the dispatcher:
+1. Fires `FrameReceived` for all listeners that observe raw envelopes.
+2. Checks whether the envelope has a snapshot; if not, stops processing.
+3. Fires `SnapshotReceived` with the envelope and the decoded snapshot.
+4. Looks up the route for `snapshot.OpCode`. If a route is registered, it calls the registered decoder and dispatches the typed payload to all handlers. If no route is registered, it fires `NoRouteForOpCode` for diagnostics.
+
+To register a snapshot type for opCode `42`:
+
+```csharp
+dispatcher.Register<ShooterEntityState>(42, (in WorldStateSnapshot snap, out ShooterEntityState state) =>
+{
+    state = MemoryPackSerializer.Deserialize<ShooterEntityState>(snap.Data);
+    return true;
+});
+
+dispatcher.Subscribe<ShooterEntityState>(42, (envelope, state) =>
+{
+    ApplyEntityState(state);
+});
+```
+
+The snapshot routing boundary is important: `FrameSnapshotDispatcher` operates on `ISnapshotEnvelope`, not on Gateway DTOs. The transport layer decodes wire bytes into a `FramePacket` or similar envelope before feeding it into the dispatcher. This means view and presentation layers never need to depend on transport types.
+
+<Note>
+The Shooter demo uses a dual-connection setup. The Room Gateway connection handles the control plane: login, room lifecycle, the `RoomGatewaySessionFlow` stages, reliable event acknowledgment, and full-state baseline RPC. A second, independent `NetworkTransport` handles the battle data plane: per-frame input request/response (inline matched) and snapshot push delivery. The battle push subscriber is registered only on the data transport. The Room control connection must not have a duplicate snapshot push subscription active at the same time, or last-writer-wins binding may route pushes back to the control connection.
+</Note>
+
+## `WorldStateSnapshot`: The Framework Snapshot Envelope
+
+`WorldStateSnapshot` is the framework-level snapshot metadata structure. It carries a world ID, version, frame number, timestamp, world flags, a full/delta flag, and an opCode that `FrameSnapshotDispatcher` uses for routing. The actual entity payload is carried separately by business-layer snapshot types (such as Shooter's `ShooterPackedSnapshot`).
+
+Key operations:
+
+```csharp
+// Serialize to bytes (MemoryPack)
+byte[] bytes = snapshot.ToBytes();
+
+// Deserialize from bytes
+WorldStateSnapshot restored = WorldStateSnapshot.FromBytes(bytes);
+
+// Compute state hash (framework metadata only — does not include entity payloads)
+ulong hash = snapshot.ComputeHash();
+
+// Deep copy
+WorldStateSnapshot copy = snapshot.Clone();
+```
+
+<Warning>
+`WorldStateSnapshot.ComputeHash()` only combines `Version`, `Frame`, `Timestamp`, and `WorldFlags`. It does not include entity payloads or the `WorldId`. Because `Timestamp` participates in the hash, two endpoints that generate the same logical snapshot at different wall-clock times will produce different hash values. For determinism verification, use `ComputeWithBusinessData(IBusinessHashProvider)` or a project-specific stable hasher such as Shooter's `ShooterStateHasher`.
+</Warning>
+
+## `SnapshotBuffer`: Thread-Safe Per-Frame Snapshot Cache
+
+`SnapshotBuffer` stores `WorldStateSnapshot` objects indexed by frame number. It is thread-safe and enforces a configurable capacity limit. Writes store a `Clone()` of the snapshot, and reads return a new clone, so external code can never accidentally mutate cached state.
+
+```csharp
+// Store a snapshot at frame 200
+buffer.Store(new FrameIndex(200), snapshot);
+
+// Read it back (returns a clone)
+if (buffer.TryGet(new FrameIndex(200), out var cached)) { /* use cached */ }
+
+// Trim frames before 150 (free memory for confirmed frames)
+buffer.RemoveBefore(new FrameIndex(150));
+```
+
+The default capacity is 128 frames. Frequently storing and reading snapshots produces allocation cost from serialization round-trips; this should be budgeted against the game's performance envelope.
+
+## `PredictionCoordinator`: Local Prediction and Server Reconciliation
+
+`PredictionCoordinator` manages the client-side prediction loop for state sync. It tracks the current prediction frame, a history of applied inputs per frame, and a dictionary of predicted state snapshots. When authoritative state arrives, it validates, reconciles, and replays inputs from the server-confirmed frame onward.
+
+**Prediction path** — `ProcessInput(command)` or `ProcessInputs(batch)` advances the local frame by one, records inputs to history, calls `IPredictionHandler.Predict(input, currentSlots, frame)` for each registered handler, then snapshots the frame-end state into `DictionarySnapshotStore`.
+
+**Reconciliation path** — `ApplyServerSnapshot(serverFrame, serverSlots, objectId)` compares the server-authoritative state to the stored prediction for `serverFrame`. If `ConflictLevel.None`, it advances `confirmedFrame` and fires `OnServerStateApplied`. If a conflict is detected, it:
+1. Captures the complete list of input batches from `serverFrame` to the original predicted frame.
+2. Overwrites current slots with the authoritative server state.
+3. Sets `confirmedFrame = serverFrame` and calls `PruneBefore(serverFrame)`.
+4. Clears the input history.
+5. Calls `ReplayInputFrames` using the captured batches (preserving per-frame order, including empty-input frames).
+
+`DictionarySnapshotStore.Record` and `DictionarySnapshotStore.Get` both return isolated clones, so external modifications to a returned snapshot never contaminate the store. For `StateSlots` containing reference-type values, projects must provide an `IStateSlotValueCloner` — the coordinator fast-fails rather than silently sharing mutable objects.
+
+## Per-Entity and ECS Prediction Modes
+
+The framework supports two patterns for applying server corrections:
+
+**Per-entity slots** — `StateSlots` stores named float/int/bool/position/quaternion values for a single entity. `IPredictionHandler` reads and writes slots during prediction and server-state application. This is suitable for characters with a manageable number of predictable properties.
+
+**ECS / packed snapshot mode** — Shooter's `ShooterPackedSnapshotImporter` reconstructs full entity state from a compact binary payload. `ShooterPackedSnapshotRollbackProvider` wraps the same codec as an `IRollbackStateProvider`, so the same packed snapshot format serves both state sync push and rollback capture.
+
+## `StateHash` for Drift Detection
+
+`StateHashMessage` carries a frame number and a hash computed from stable entity state. Clients record their predicted hash for each frame and compare it against the server hash when it arrives. A mismatch triggers reconciliation without requiring a full snapshot transmission.
+
+```csharp
+// Server sends StateHashMessage at frame 300
+// Client checks its predicted hash for frame 300
+reconciler.OnAuthoritativeHash(frame: 300, authoritativeHash: serverHash);
+// If mismatch, fires OnRollbackRequested(frame: 300)
+```
+
+Because hash computation is not standardized by the framework, every project must implement a stable, platform-consistent hasher. The Shooter demo provides `ShooterStateHasher`, which iterates players, bullets, and enemies in a deterministic order and combines their key state fields.
+
+## What Projects Own
+
+State sync provides the pipeline. Projects are responsible for:
+
+- **Full and delta snapshot schema**: Designing the wire format for full baselines and incremental deltas, including which entity fields are included, the AOI boundary, and how entities enter or leave the snapshot.
+- **Entity recovery**: Handling reconnect, late join, and AOI entry by requesting a full baseline rather than applying a delta without a known base.
+- **Interpolation strategy**: Deciding how remote entities move between received snapshots. Shooter uses `RemoteInterpolationPlayback`; the framework does not prescribe an interpolation algorithm.
+- **Capacity and baseline switching**: Configuring snapshot budget (`MaxEntityCount`, `ActiveSyncBudget`) and deciding when to request a full resync.
+- **`IsCompressed` / payload codec pairing**: `SnapshotMessage.IsCompressed` is a protocol field that `ParseSnapshot<T>` does not automatically act on. If you use compression, your transport codec must both set the flag on write and decompress on read. The flag and the compression logic must be paired in the same route.

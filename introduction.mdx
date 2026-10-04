@@ -1,0 +1,121 @@
+---
+title: "Introduction to the AbilityKit Game Combat Framework"
+sidebarTitle: "Introduction"
+description: "AbilityKit is a modular C# combat toolkit for mid-to-large games, providing composable packages for skills, triggers, sync, and more."
+---
+
+AbilityKit is a composable game combat toolkit built for mid-to-large C# projects. It is organized as a collection of Unity UPM packages and .NET projects that you can combine based on your project's needs — not a single monolithic framework you install wholesale. The core combat modules are written in pure C# and can run on the server, in a console process, or inside Unity. Unity-specific code handles scene entry, asset authoring, presentation projection, and editor tooling. Game rules, room flow, account integration, skill configuration conventions, session composition roots, and presentation strategy remain the responsibility of each individual project.
+
+<Note>
+  AbilityKit is currently in active development. Package boundaries, dependency declarations, sample projects, and documentation are still converging. APIs and directory structures may continue to change. Do not treat the existence of source code as a signal of production readiness.
+</Note>
+
+## What AbilityKit Is (and Isn't)
+
+AbilityKit's goal is to break down the parts of a complex combat project that most easily become unmanageable — skill sequencing, trigger rules, effect execution, Buff lifecycle, projectile tracking, attribute systems, target selection, logical world, input frames, snapshots, prediction rollback, replay, and cross-platform presentation — into reusable, testable, synchronizable, and diagnosable modules.
+
+<Tabs>
+  <Tab title="More Suitable For">
+    AbilityKit provides the highest value when your project's complexity is expected to grow over time.
+
+    | Scenario | Why It Helps |
+    |---|---|
+    | MOBA, ARPG, MMO, RTS, multiplayer action, Shooter with complex skills | Skills, Buffs, projectiles, passives, attributes, targeting, and sync all tend to grow together |
+    | Server/client sharing pure C# combat logic | Core logic is decoupled from Unity scenes and can run on servers and in tests |
+    | Configurable skills and auditable rules | Trigger Plan, Action Schema, and Pipeline reduce the risk of scattered script logic |
+    | Combat logging, replay, automated testing, prediction rollback, or state sync | Input frames, snapshots, record tracks, and source lineage help reproduce and diagnose issues |
+    | Teams that need to govern framework boundaries long-term | Packages, modules, services, contexts, and presentation adapters all have explicit boundaries |
+  </Tab>
+  <Tab title="Less Suitable For">
+    AbilityKit introduces real organizational and learning costs. For some projects, lighter solutions are faster.
+
+    | Scenario | Why It May Not Pay Off |
+    |---|---|
+    | Small single-player projects with a handful of fixed skills | A simple `SkillManager` or `BuffManager` MonoBehaviour is faster to ship |
+    | Rapid prototypes or one-off deliveries | The learning and setup cost outweighs the long-term governance benefits |
+    | Projects with no sync, replay, or source-tracing requirements | Many of the highest-value capabilities will go unused |
+    | All logic can safely live inside Unity scene scripts | The pure C# layering and cross-platform reuse provide limited value |
+  </Tab>
+</Tabs>
+
+## Three-Layer Responsibility Model
+
+AbilityKit enforces a clear separation between what the framework owns, what your project owns, and what the sample hosts demonstrate. Understanding this boundary is the single most important mental model for working with AbilityKit effectively.
+
+| Layer | What It Owns | What It Does Not Decide |
+|---|---|---|
+| **Framework Mechanism Layer** | Phase/Trigger/Action contracts, World/Host lifecycle interfaces, ECS adapters, sync/snapshot/record/network/diagnostic infrastructure | Hero rules, room phases, account login, UI flow, specific config table structure |
+| **Project Application Layer** | Composition root, session, config publication, authority model, system ordering, failure compensation, presentation projection, asset ownership | Wrapping a single project's strategy into a framework default that all games must follow |
+| **Example/Host Layer** | Runnable or auditable references: Tiny, MOBA, Shooter, Console, ET, Unity Starter, Orleans | Proving that another host, sync mode, or project ruleset will automatically work |
+
+This boundary is the core trade-off of the toolkit: the framework provides fine-grained, composable building blocks; the samples provide high-fidelity complete object graphs; but a real project can replace the application layer without forking the base mechanisms.
+
+## Five Capability Tiers
+
+AbilityKit's capabilities are organized into five progressive tiers. Each tier builds on the one below it, allowing you to adopt exactly as much of the framework as your project currently needs. You are not required to adopt all tiers at once, and stopping at any tier is a valid architectural choice.
+
+<CardGroup cols={2}>
+  <Card title="Foundation" icon="layer-group">
+    **Packages:** `com.abilitykit.core` + `com.abilitykit.world.di`
+
+    The base infrastructure tier. Provides the event system, object pool, math library, stable ID registry, and a scoped dependency-injection container with `Singleton`, `Scoped`, and `Transient` lifetimes. All other tiers build on Foundation.
+
+    **Start here** when validating a new project setup, writing infrastructure tests, or checking service-scope behavior.
+  </Card>
+  <Card title="SkillCore" icon="wand-magic-sparkles">
+    **Packages:** Foundation + `triggering` + `pipeline` + `attributes`
+
+    Adds the minimum viable combat core: a configurable skill sequencing engine (Pipeline), an event-driven rule execution system (Triggering), and a Buff/attribute modifier runtime. Enough to run skills, Buffs, passive triggers, and associated tests without any network layer.
+
+    **Start here** when your project needs configurable skills, Buff logic, passive triggers, or event-driven rule execution.
+  </Card>
+  <Card title="BattleRuntime" icon="crosshairs">
+    **Packages:** SkillCore + `combat.targeting` + `combat.projectile` + `combat.damage`
+
+    Adds mid-to-large combat gameplay: target search and filtering, projectile lifecycle management, a damage pipeline with custom formulas, motion, collision, and navigation. Enables validation of targeting, hit detection, damage flow, and Trace output.
+
+    **Start here** when you need projectiles, area effects, damage chains, or complex target-selection logic.
+  </Card>
+  <Card title="SyncRuntime" icon="rotate">
+    **Packages:** BattleRuntime + `world.framesync` + `world.snapshot` + `world.statesync` + `record` + network packages
+
+    Adds multiplayer synchronization: frame-lock input, snapshot routing and dispatch, state-hash verification, client prediction and rollback, replay recording, and reconnection support. Enables validation of input frames, snapshot application, state hashes, and replays.
+
+    **Start here** when your project requires multiplayer sync, client-side prediction, replay, or state-consistent reconnection.
+  </Card>
+  <Card title="ServerRuntime" icon="server">
+    **Packages:** `protocol` + `host` + `host.extension` + server-side adapters (Orleans)
+
+    Adds the server-side authority layer: World lifecycle management, client connections, message broadcasting, room grains, battle grains, and a gateway. Enables starting room/battle hosts and verifying basic flows via smoke tests.
+
+    **Start here** when your project requires an authoritative server, room management, or gateway services.
+  </Card>
+</CardGroup>
+
+## Framework vs. Alternative Approaches
+
+AbilityKit is most closely positioned as a "combat capability toolbox for the Unity/C# ecosystem," rather than a single large engine system.
+
+| Dimension | Unreal GAS | Typical Unity Skill Frameworks | AbilityKit |
+|---|---|---|---|
+| Engine binding | Strongly bound to Unreal | Most are bound to Unity presentation or `MonoBehaviour` | Core logic is pure C#; Unity is one of several runtime environments |
+| Capability scope | Ability, Attribute, Effect, Tag are well-developed | Usually focused on skills, Buff, and config | Covers skills, triggers, effects, combat, sync, replay, host, and samples |
+| Sync support | Depends on Unreal's network model | Projects typically design this themselves | Provides FrameSync, Snapshot, StateSync, Rollback, Record as composable packages |
+| Adoption model | Engine-level system | Project-level framework | UPM packages composed on demand |
+| Sample posture | Engine ecosystem examples | Typically a single-project demo | MOBA, Shooter, Console, Server — multi-scenario reference implementations |
+| Can run outside Unity | Not applicable | Implementation-dependent | Pure C# logic is fully verifiable via `src/` projects and server builds |
+
+AbilityKit's advantage is not that every module is in its final form. It is that several key boundaries of a complex combat project — config execution, runtime instances, source tracing, presentation events, sync snapshots, replay verification, and server hosting — are all governed inside the same source boundary.
+
+## Available Demo Projects
+
+The repository includes several reference samples that illustrate how the framework capabilities land in a real project. These are not required dependencies — they are auditable and runnable examples of how the mechanisms compose.
+
+| Demo | Primary Focus | What to Reuse |
+|---|---|---|
+| **Tiny** | Minimum multiplayer path from deterministic rules to Room, sync modes, recovery, and project assembly | Network/Room, sync and rollback mechanisms; input semantics, combat rules, and presentation belong to your project |
+| **MOBA Console** | Full combat loop in a pure .NET process — World, Host, sync adapter, input, presentation projection, replay | Understanding the complete composition root and non-Unity validation; its Local/Hybrid adapters are not public framework APIs |
+| **MOBA Unity** | Skill input, Pipeline, Trigger Plan, Buff/Continuous, projectile, area, damage, motion, collision, BT AI, presentation cue, config loading, Entitas integration | Shared interfaces, combat mechanisms, and layering philosophy; hero rules, Blueprints, service facades, system order, and config schema are MOBA project strategy |
+| **Shooter Unity** | Authority interpolation, prediction correction, snapshot projection, reliable events, reconnect recovery, Svelto ECS, dual-connection network, multi-process verification | Sync, snapshot, network, and record components; Room flow, client controller, presentation step order, and capacity strategy are Shooter project strategy |
+| **ET Host** | Connecting ET Scene, Component/System, room players, and presentation objects to the MOBA runtime | Reference for third-party host adaptation; real projects are not required to use ET's object model |
+| **Orleans Server/Smoke** | Gateway, Room, Battle Host, protocol routing, state storage boundary, multi-process verification | Reference for the server authority chain and verification methodology |

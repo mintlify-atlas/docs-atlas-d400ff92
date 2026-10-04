@@ -1,0 +1,235 @@
+---
+title: "Core Concepts: Terms, Source Boundaries, and Mental Models"
+sidebarTitle: "Core Concepts"
+description: "Definitions of World, Entity, Frame, Input, Snapshot, Skill, Pipeline, Trigger, Context, and Adapter — each grounded in real AbilityKit source paths."
+---
+
+AbilityKit uses a specific vocabulary that differs from typical Unity MonoBehaviour patterns or OOP-style game frameworks. This page maps each major concept to its real meaning in source code, explains where it lives, and flags the most common points of confusion. Read this before exploring individual package documentation — the terms will appear everywhere.
+
+The concepts below are grouped into four areas: the logical world and ECS layer, the synchronization layer, the gameplay expression layer, and the adapter/port/sink layer. Together they form the runtime object graph that the Console Demo and Unity demos assemble at startup.
+
+## The Logical World and ECS Layer
+
+The first area to understand is how AbilityKit separates the "container for services and systems" from the "container for entity state." These are two distinct things in the codebase, and conflating them is one of the most common early mistakes.
+
+<CardGroup cols={2}>
+  <Card title="World" icon="globe">
+    **Not a Unity Scene.** A `World` in AbilityKit is a logical runtime container that holds services, systems, modules, and lifecycle management. It can run inside Unity, a console process, a server, or a test harness.
+
+    The term appears at two levels in source:
+
+    - **Runtime World** (`IWorld`, `WorldManager`, `IWorldResolver`) — assembles services, installs modules, manages lifecycle.
+    - **ECS World** (`EntityWorld`) — stores entities, components, component indexes, parent-child relationships, and world events.
+
+    **Source:** `src/AbilityKit.World.ECS/Impl/EntityWorld.cs`, `Unity/Packages/com.abilitykit.world.di/Runtime/World/DI/WorldContainer.cs`
+  </Card>
+  <Card title="Entity" icon="fingerprint">
+    **Not an OOP object.** An Entity in AbilityKit's lightweight ECS is a versioned handle — a value type with an `Index` and a `Version`. The version prevents a stale handle from accidentally operating on a reused slot.
+
+    In different parts of the codebase you will encounter:
+    - **Lightweight ECS handle** (`IEntity`, `IEntityId`, `EntityWorld`) — generic entity/component storage.
+    - **Demo battle entity** (Console Battle ECS factory/query) — characters, projectiles, and state snapshots.
+    - **Entitas entity** (MOBA Entitas contexts) — complex MOBA runtime system chains.
+
+    **Source:** `Unity/Packages/com.abilitykit.world.ecs/Runtime/AbilityKit.World.ECS/Core/EntityQuery.cs`
+  </Card>
+  <Card title="Component" icon="puzzle-piece">
+    **A data carrier, not a behavior host.** Components are value-type or reference-type data structs that systems read and write. They should not contain complex flow control. Components are stored per-entity in the `EntityWorld`'s component tables and can be queried by type across all entities.
+
+    Components in the MOBA/Shooter demos may follow Entitas conventions (separate fields per component), while the lightweight ECS uses generic typed storage.
+
+    **Source:** `src/AbilityKit.World.ECS/Impl/EntityWorld.cs`
+  </Card>
+  <Card title="System / Feature" icon="microchip">
+    **Not a single interface.** Systems and Features are the execution units of AbilityKit's logic loop, but they exist at multiple levels with different interfaces:
+
+    - **Lightweight ECS** (`EntityQuery<T>`) — provides entity/component storage and queries; no unified system interface.
+    - **Entitas World systems** (`WorldSystemBase`) — `Initialize / Execute / Cleanup / TearDown` lifecycle.
+    - **Demo Features** (`FeatureHost`, `ConsoleInputFeature`, `ConsoleSyncFeature`) — per-frame function blocks inside a battle phase.
+    - **Phase** (`PreparePhase`, `InMatchPhase`, `EndPhase`) — manages battle startup, loading, in-match, and end-of-battle states.
+
+    **Source:** `src/AbilityKit.Demo.Moba.Console/Battle/Flow/Phases/InMatchPhase.cs`
+  </Card>
+</CardGroup>
+
+### Minimal EntityWorld Example
+
+The following snippet comes directly from the lightweight ECS source. It shows the complete create/with/query pattern. Note that components are value types — after modifying a queried component, you must write it back with `entity.With(component)`.
+
+```csharp
+public struct Position
+{
+    public float X;
+    public float Z;
+}
+
+public struct MoveSpeed
+{
+    public float Value;
+}
+
+var world = new EntityWorld();
+
+var actor = world.Create("Actor_1")
+    .With(new Position { X = 0f, Z = 0f })
+    .With(new MoveSpeed { Value = 5f });
+
+world.Query<Position, MoveSpeed>().ForEach((entity, position, speed) =>
+{
+    position.X += speed.Value * 0.033f;
+    entity.With(position);   // write back the modified value type
+});
+```
+
+<Note>
+  `IEntity` is a value-type handle, not a traditional OOP actor object. The entity's data lives in the component tables of the `EntityWorld`, not on the handle itself.
+</Note>
+
+## The Synchronization Layer
+
+The synchronization layer handles "on which logical frame was which input applied, and how do we replay or verify the result." It is intentionally separated from the gameplay logic so that the same skill code can run in local single-player, lockstep, state-sync, or replay mode without modification.
+
+<CardGroup cols={2}>
+  <Card title="Frame" icon="clock">
+    **Not a render frame.** A `Frame` in AbilityKit is a discrete logical advancement unit. The synchronization adapter exposes separate `LogicTimeSeconds` and `RenderTimeSeconds` so that logic progression and visual interpolation are handled independently.
+
+    A `FrameIndex` is a value-type wrapper around the logical frame number. Systems that need deterministic behavior use `FrameIndex` rather than wall-clock time.
+
+    **Source:** `Unity/Packages/com.abilitykit.world.framesync/Runtime/Host/PlayerInputCommand.cs`
+  </Card>
+  <Card title="Input" icon="gamepad">
+    **Not a direct method call.** Input in AbilityKit is a synchronizable, recordable, replayable command. Every input carries `FrameIndex + PlayerId + OpCode + Payload`. The framework does not fix the business meaning of `OpCode` — move, skill, stop, and attack all become different opcode values with binary payloads that the project's protocol layer interprets.
+
+    ```csharp
+    public readonly struct PlayerInputCommand
+    {
+        public readonly FrameIndex Frame;
+        public readonly PlayerId Player;
+        public readonly int OpCode;
+        public readonly byte[] Payload;
+    }
+    ```
+
+    **Source:** `Unity/Packages/com.abilitykit.world.framesync/Runtime/Host/PlayerInputCommand.cs`
+  </Card>
+  <Card title="Snapshot" icon="camera">
+    **The bridge between logic and presentation.** A Snapshot captures the state of some or all entities at a specific frame and distributes it to consumers: the view layer for rendering, the network layer for sync, and the record layer for replay.
+
+    Two snapshot types appear frequently:
+    - `FrameSnapshot` — used for replay/record or sync dispatch.
+    - `ActorStateSnapshot` — the per-actor state snapshot consumed by the Console Demo's view layer.
+
+    **Source:** `Unity/Packages/com.abilitykit.world.snapshot/Runtime/SnapshotRouting/FrameSnapshotDispatcher.cs`
+  </Card>
+  <Card title="Session / Flow / Phase" icon="timeline">
+    **Organizational concepts, not a mandatory state machine.** Session, Flow, and Phase are how the Console Demo organizes a battle's application lifecycle, but AbilityKit does not force all projects to use this exact structure.
+
+    The framework cares about *when* the World/Host is created, ticked, and torn down, and *when* the input, sync, and presentation ports become available. Different projects may use an HFSM, async tasks, server Actor lifecycles, or their own flow system.
+
+    **Source:** `src/AbilityKit.Demo.Moba.Console/Battle/Flow/BattleFlow.cs`
+  </Card>
+</CardGroup>
+
+## The Gameplay Expression Layer
+
+The gameplay layer is where skills, triggers, effects, and Buffs live. These modules answer "what happens when a player casts a skill" and "what happens when a combat event fires."
+
+<CardGroup cols={2}>
+  <Card title="Skill / Pipeline / Runtime" icon="bolt">
+    **Pipeline is the stable framework concept; SkillCastRuntime is a MOBA application-layer type.** The framework provides `AbilityPipeline<TCtx>` for phase lifecycle management (execute, pause, interrupt, terminal state) and the contracts for Trigger/Effect execution context. The MOBA demo wraps a cast into `SkillCastRequest`, sends it into `SkillPipelineContext`, and tracks it through `MobaSkillCastRuntime`.
+
+    These MOBA-specific types are project application layer models, not public framework DTOs. Your project can use a completely different request model and skill slot system.
+
+    **Source:** `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Skill/Pipeline/SkillPipelineContext.cs`
+  </Card>
+  <Card title="Trigger / Effect / Context" icon="fire">
+    **Context propagation is the key design.** A Trigger fires when a condition is met; an Effect changes combat state (deal damage, add Buff, spawn projectile). The hard part is that every effect must know its source, target, ownership, root context, trigger reason, and runtime boundaries — which is why AbilityKit uses multi-layer Context rather than a flat parameter bag.
+
+    Note: there are two distinct `TriggerContext` types in source:
+    - `AbilityKit.Triggering.Runtime.Context.TriggerContext` (`com.abilitykit.triggering`) — aggregates the blackboard, event bus, frame clock, RNG, and function/action registries.
+    - `AbilityKit.Ability.Triggering.TriggerContext` (`com.abilitykit.ability`) — ability-layer trigger context with object pool, local/global variables, source/target/event.
+
+    **Source:** `Unity/Packages/com.abilitykit.triggering/Runtime/Context/TriggerContext.cs`
+  </Card>
+</CardGroup>
+
+## The Adapter / Port / Sink Layer
+
+The adapter layer is what allows the same input intent to flow into a local sync adapter, a network input port, an automated test script, or a replay player — without the upstream code knowing which backend is active.
+
+<CardGroup cols={2}>
+  <Card title="Adapter" icon="plug">
+    **A strategy adapter, not a network protocol.** `IBattleSyncAdapter` unifies the sync call surface in the Console Demo. It exposes: `Mode`, `CurrentFrame`, `LogicTimeSeconds`, `RenderTimeSeconds`, `SubmitInput`, `Tick`, `GetAllActorStates`, and `OnActorStateSnapshot`.
+
+    Concrete implementations: `FrameSyncAdapter`, `StateSyncAdapter`, `HybridSyncAdapter`.
+
+    **Source:** `src/AbilityKit.Demo.Moba.Console/Bootstrap/ConsoleBattleBootstrapper.cs`
+  </Card>
+  <Card title="Port" icon="ethernet">
+    **The typed entry point for runtime input.** `IMobaBattleInputPort` is the runtime-facing input interface. `IWorldInputSink` is the abstract sink that bridges player intentions to the underlying sync or direct-call backend.
+
+    Concrete sinks: `DirectCallInputSink` (for local, no-network tests) and `RuntimePortInputSink` (for the full pipeline).
+
+    **Source:** `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/`
+  </Card>
+  <Card title="Sink" icon="filter">
+    **Where output goes.** A Sink consumes the output of the logic layer — presentation events, snapshots, view cues. `ViewEventSink`, `SnapshotDispatcher`, and `PresentationCue` are the main output consumers in the demo projects. The Console Demo's view layer reads from `ConsoleBattleView`, which subscribes to actor state snapshots.
+
+    **Source:** `src/AbilityKit.Demo.Moba.Console/Battle/Features/ConsoleViewFeature.cs`
+  </Card>
+  <Card title="Registry" icon="book">
+    **ID-stable lookup tables.** Registries provide determinism-safe lookups for component types, functions, and actions. `ComponentRegistry` maps C# types to stable integer IDs. `FunctionRegistry` and `ActionRegistry` map string names to typed executors inside the Triggering system.
+
+    **Source:** `Unity/Packages/com.abilitykit.core/Runtime/Generic/StableStringIdRegistry.cs`
+  </Card>
+</CardGroup>
+
+## Complete Term Reference
+
+The table below summarizes every major term used throughout the AbilityKit documentation, its conceptual position, and its primary source boundary.
+
+<Accordion title="Full Glossary (all terms)">
+  | Term | Conceptual Role | Source Boundary |
+  |---|---|---|
+  | **AbilityKit** | Collection of composable combat capability packages | Multi-package, multi-demo, multi-backend framework family |
+  | **World** | Logical runtime container | `IWorld`, `WorldManager`, `IWorldResolver`, `EntityWorld` |
+  | **Entity** | State identity or handle | `IEntity`, `IEntityId`, Entitas entity, Demo actor/net ID |
+  | **Component** | Data stored on an entity | Value-type component, reference component, Entitas component, Demo ECS component |
+  | **System** | Logic executed on a lifecycle schedule | Entitas `WorldSystemBase`, module installation systems, business systems |
+  | **Feature** | Pluggable function block inside a demo phase | `FeatureHost` manages input, sync, view, entity features |
+  | **Frame** | Logical tick | `FrameIndex` or adapter `CurrentFrame` |
+  | **Input** | Synchronizable player command | `PlayerInputCommand`, `PlayerInput`, OpCode/Payload |
+  | **Snapshot** | State captured at a frame or moment | `FrameSnapshot`, `ActorStateSnapshot`, presentation event data |
+  | **Skill** | Skill configuration and a single cast action | `SkillCastRequest`, pipeline, runtime service |
+  | **Pipeline** | Phase lifecycle management — pause, interrupt, terminal state | `AbilityPipeline<TCtx>` manages phases; `SkillPipelineContext` is MOBA project context |
+  | **Runtime** | Long-lived execution state | `MobaSkillCastRuntime`, runtime handle, blackboard, children |
+  | **Trigger** | Executes actions when conditions are met | Triggering runtime, Ability trigger context, event bus |
+  | **Effect** | An action that changes combat state | Damage, Buff, projectile, presentation cue, downstream execution |
+  | **Context** | Cross-layer propagated facts | Combat source, lineage, origin, execution snapshot |
+  | **Session** | Outer wrapper of a battle lifecycle | Console session hooks, battle start config/plan |
+  | **Flow** | Battle flow control | `BattleFlow`, `PhaseHost`, Phase transitions |
+  | **Adapter** | Strategy adaptation layer | Sync adapter, input sink, runtime port |
+  | **Registry** | ID/type/function lookup table | `ComponentRegistry`, `FunctionRegistry`, `ActionRegistry` |
+  | **Blackboard** | Shared runtime data area | Trigger blackboard, Skill runtime blackboard |
+  | **Port** | Typed input entry point for the runtime | `IMobaBattleInputPort`, `IWorldInputSink` |
+  | **Sink** | Output consumer for presentation or network | `ViewEventSink`, `SnapshotDispatcher`, `PresentationCue` |
+</Accordion>
+
+## Common Misconceptions
+
+Several misconceptions about these terms appear regularly when first reading the source. The table below captures the most important ones.
+
+<Accordion title="Boundary Clarifications">
+  | Common Assumption | Actual Design Boundary |
+  |---|---|
+  | AbilityKit is a skill system | It covers World, ECS, skills, triggers, sync, presentation, demos, and test shells simultaneously |
+  | World = Unity Scene | World is a logical container and service boundary; it can run in Console, server, or test environments |
+  | Entity = business actor object | In the lightweight ECS, Entity is a handle; data lives in component tables |
+  | Input type is always an enum | Real sync input uses `OpCode + Payload`; the business layer interprets the opcode |
+  | Logical frame = render frame | The sync layer advances logic time; the view layer can interpolate with render time |
+  | TriggerContext is one class | There are at least two distinct TriggerContext types in source with different responsibilities |
+  | System uses a single interface | Lightweight ECS, Entitas, Feature, and Phase each have different execution boundaries |
+  | Ignoring Context/Lineage is fine | Without context propagation, damage, Buff, projectile, replay, and diagnostics cannot trace their sources |
+  | MOBA SkillCast types are framework DTOs | They are application-layer models; the stable contracts are Pipeline, Trigger, Effect, and Context capability contracts |
+  | Console Flow/Phase = universal battle flow | It is one runnable reference; projects may use different flows as long as they maintain World/Host and port lifecycles |
+</Accordion>

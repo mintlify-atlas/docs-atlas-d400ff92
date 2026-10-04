@@ -1,0 +1,322 @@
+---
+title: "Combat Primitives: Targeting, Projectile, Damage, and More"
+sidebarTitle: "Combat Primitives"
+description: "Pure-C# combat building blocks — Targeting pipeline, Projectile world, Damage calculation, Motion solver, Collision, Navigation, Attributes, and Modifiers."
+---
+
+AbilityKit's combat layer is a collection of small, composable **pure C# primitives** — no Unity dependency, no ECS requirement, no frame-sync assumption. Each primitive solves exactly one mechanical concern. A skill can use Targeting to find candidates, Projectile to fly towards them, Damage to compute numeric results, and Motion to resolve movement constraints, all without any of those systems knowing about each other. This page surveys every combat primitive and the key types you need to integrate or extend them.
+
+<Note>
+Every primitive listed here is usable on dedicated servers, consoles, editors, and unit tests. None of them depend on `UnityEngine`, `Entitas`, or `com.abilitykit.world.framesync`. Frame-sync rollback is an opt-in adapter, not a hard dependency.
+</Note>
+
+## Primitives Overview
+
+<CardGroup cols={2}>
+  <Card title="Targeting" icon="crosshairs">
+    Candidate → Rule → Scorer → Selector pipeline for finding and ranking targets.
+    
+    Package: `com.abilitykit.combat.targeting`
+  </Card>
+  <Card title="Projectile" icon="location-arrow">
+    Deterministic tick-loop world for flying entities — movement, collision, hit policy, and rollback.
+    
+    Package: `com.abilitykit.combat.projectile`
+  </Card>
+  <Card title="Damage" icon="fire">
+    Dataflow processor chain: Validate → Crit → Base → Bonus → Armor → MagicResist → Final → Overkill.
+    
+    Package: `com.abilitykit.combat.damage`
+  </Card>
+  <Card title="Motion" icon="person-running">
+    Multi-source priority/stacking pipeline with constraint solvers for wall-slide, pass-through, and endpoint projection.
+    
+    Package: `com.abilitykit.combat.motion`
+  </Card>
+  <Card title="Collision" icon="circle">
+    Pluggable collision world abstraction — naive and grid-based implementations, OBB sweep, broadphase.
+    
+    Package: `com.abilitykit.combat.collision.abstractions`
+  </Card>
+  <Card title="Navigation" icon="map">
+    Deterministic integer A* grid pathfinder for server-authoritative and lock-step environments.
+    
+    Package: `com.abilitykit.combat.navigation`
+  </Card>
+  <Card title="Attributes" icon="chart-bar">
+    Attribute registry, dependency graph, formula/constraint system, and `ModifierCalculator`.
+    
+    Package: `com.abilitykit.attributes`
+  </Card>
+  <Card title="Modifiers" icon="sliders">
+    Generic modifier data model: Add, Multiply, Override, PercentAdd, TimeDecay, Pipeline — usable outside the attribute system.
+    
+    Package: `com.abilitykit.modifiers`
+  </Card>
+</CardGroup>
+
+---
+
+## Targeting
+
+`TargetSearchEngine` executes a five-phase query: candidates are enumerated by an `ICandidateProvider`, filtered by `ITargetRule` instances, scored by `ITargetScorer`, selected by `ITargetSelector`, and optionally mapped to domain objects by `ITargetMapper<T>`.
+
+```csharp
+// Source: com.abilitykit.combat.targeting
+// Runtime/SearchTarget/Execution/TargetSearchEngine.cs
+
+var engine = new TargetSearchEngine();
+var results = new List<EntityId>(3);
+
+using var context = new SearchContext
+{
+    PositionProvider = positionProvider,
+    EntityKeyProvider = entityKeyProvider
+};
+
+using var builder = SearchPipelineBuilder.Create();
+builder.From(visibleEnemyProvider);
+builder.Filter(new CircleShapeRule(casterPosition, skillRadius));
+builder.Filter(new ExcludeEntityRule(casterId));
+builder.ScoreBy(new DistanceToEntityScorer(casterId));
+builder.Select(new StreamingTopKByScoreSelector());
+builder.Take(3);
+var query = builder.Build();
+
+engine.SearchIds(in query, context, results);
+```
+
+<Accordion title="Key Targeting Types">
+
+| Type | Source | Role |
+|------|--------|------|
+| `TargetSearchEngine` | `Execution/TargetSearchEngine.cs` | Executes the full query pipeline |
+| `SearchQuery` | `Queries/SearchQuery.cs` | Immutable query definition — provider, rules snapshot, scorer, selector, limits |
+| `SearchContext` | `Execution/SearchContext.cs` | Per-call context: `PositionProvider`, `EntityKeyProvider`, `SearchStats`, and typed extension keys |
+| `ICandidateProvider` | `Providers/ICandidateProvider.cs` | Enumerates candidate entity IDs from any source |
+| `ITargetRule` | `Rules/ITargetRule.cs` | Boolean per-candidate gate (AND semantics in top-level list) |
+| `ITargetScorer` | `Scorers/ITargetScorer.cs` | Assigns a comparable score for ranking |
+| `ITargetSelector` | `Selectors/ITargetSelector.cs` | Post-hit selection strategy (full view or streaming Top-K) |
+| `IStreamingTopKByScoreSelector` | `Selectors/ITargetSelector.cs` | Capability marker enabling the engine's fused Top-K path (no full hit list) |
+| `SearchPipelineBuilder` | `Pipeline/SearchPipelineBuilder.cs` | Fluent `ref struct` builder; must be `Dispose`d after `Build()` |
+
+</Accordion>
+
+<Tip>
+For small K (e.g., "take the 3 nearest"), implement `IStreamingTopKByScoreSelector` and set `MaxCount > 0` to enable the fused path. The engine maintains only K slots during candidate iteration instead of collecting all hits.
+</Tip>
+
+---
+
+## Projectile
+
+`ProjectileWorld` is a self-contained tick loop that moves projectiles, raycasts against an `ICollisionWorld`, evaluates hit filters and policies, and fires typed events. `ProjectileService` wraps the world with scheduling, scatter patterns, and rollback integration.
+
+```csharp
+// Source: com.abilitykit.combat.projectile
+// Runtime/Projectile/Runtime/ProjectileWorld.cs
+// Runtime/Projectile/Services/ProjectileService.cs
+
+// Spawn a projectile
+var spawnId = projectileService.Spawn(new ProjectileSpawnParams
+{
+    Origin       = origin,
+    Direction    = direction,
+    Speed        = 20f,
+    LifetimeFrames = 120,
+    HitPolicy    = new PierceHitPolicy(maxHits: 3),
+    HitFilter    = teamHitFilter,
+});
+
+// Advance the world each logic frame
+projectileWorld.Tick(frame, fixedDeltaSeconds);
+```
+
+<Accordion title="Key Projectile Types">
+
+| Type | Source | Role |
+|------|--------|------|
+| `ProjectileWorld` | `Runtime/ProjectileWorld.cs` | Active projectile list, tick, collision, rollback export/import |
+| `ProjectileSpawnParams` | `Runtime/ProjectileSpawnParams.cs` | All per-projectile configuration at spawn time |
+| `IProjectileHitPolicy` | `Policies/IProjectileHitPolicy.cs` | Decides whether a projectile exits after a hit (pierce, bounce, expire) |
+| `IProjectileHitFilter` | `Filters/IProjectileHitFilter.cs` | Prevents duplicate hits and applies per-entity cooldowns |
+| `ProjectileRollbackProvider` | `Rollback/ProjectileRollbackProvider.cs` | Connects to `RollbackCoordinator`; exports/imports active list and next ID |
+
+Events emitted by `ProjectileWorld`: `ProjectileSpawnEvent`, `ProjectileHitEvent`, `ProjectileTickEvent`, `ProjectileExitEvent`.
+
+</Accordion>
+
+<Accordion title="Rollback Support">
+
+`ProjectileWorld` implements deterministic rollback natively. On export it serialises the full active projectile list and `_nextId`; on import it clears actives and restores the snapshot. No Unity APIs are involved.
+
+```csharp
+// Export current frame state
+var payload = projectileWorld.ExportRollback(frame);
+
+// Restore to a previous frame during rollback
+projectileWorld.ImportRollback(frame, payload);
+```
+
+</Accordion>
+
+---
+
+## Damage
+
+The damage package provides a `DataflowPipeline` of typed processors. Each processor reads from and writes to `DamageCalculationContext` slots; abort short-circuits the chain.
+
+```csharp
+// Source: com.abilitykit.combat.damage
+// Runtime/Damage/Processor/DamageProcessors.cs
+// Runtime/Damage/Data/DamageCalculationContext.cs
+// Runtime/Damage/Data/DamageData.cs
+```
+
+### Default Processor Chain
+
+```text
+DamageRequest
+  → ValidateDamageProcessor       (aborts on invalid request)
+  → CalculateCriticalProcessor    (reads CritRoll from DamageSlots — injected for determinism)
+  → CalculateBaseDamageProcessor  (base attack × multiplier)
+  → ApplyDamageBonusProcessor     (flat and percent bonuses)
+  → ApplyArmorReductionProcessor  (physical mitigation formula)
+  → ApplyMagicResistReductionProcessor
+  → CalculateFinalDamageProcessor (assembles final float value)
+  → CalculateOverkillProcessor    (excess damage beyond remaining HP)
+  → DamageResult
+```
+
+<Accordion title="DamageCalculationContext and DamageSlots">
+
+Processors communicate through strongly-typed `DamageSlots` to avoid magic strings:
+
+```csharp
+// DamageSlots — strong-typed DataflowSlot declarations
+// e.g. DamageSlots.CritRoll   — injected from above for deterministic replay
+//      DamageSlots.BaseDamage — written by CalculateBaseDamageProcessor
+//      DamageSlots.FinalDamage — assembled by CalculateFinalDamageProcessor
+//      DamageSlots.Overkill   — written by CalculateOverkillProcessor
+
+// context.Abort() stops processing immediately; subsequent processors are skipped
+```
+
+The crit random value is injected via `DamageSlots.CritRoll` by the caller, not generated inside the processor. This design makes the chain deterministic and replay-safe.
+
+</Accordion>
+
+<Note>
+The MOBA demo uses `Fixed64` arithmetic and its own `AttackCalcInfo` / `DamagePipelineService` types for confirmed determinism. The common `float`-based processor chain demonstrates the organizational pattern; your project should choose the numeric type and formula definitions that match your determinism requirements.
+</Note>
+
+---
+
+## Motion
+
+`MotionPipeline` combines multiple simultaneous motion sources (displacement skills, knockbacks, player input) with a configurable priority and stacking model, then resolves the combined vector against collision constraints.
+
+<Accordion title="Key Motion Types">
+
+| Type | Role |
+|------|------|
+| `MotionPipeline` | Aggregates sources, resolves per-frame displacement |
+| `ConfigurableMotionSolver` | Pluggable solver: wall-slide, pass-through, or endpoint projection |
+| `IMotionSource` | Contributes a velocity/displacement vector per frame |
+| `MotionSourcePriority` | Controls override vs. additive stacking when sources conflict |
+
+The pipeline outputs a resolved delta position per frame. Collision constraint solving (wall-slide keeps tangential velocity; pass-through ignores the obstacle; endpoint projection teleports to the last valid position) is handled by a project-registered solver implementation.
+
+</Accordion>
+
+---
+
+## Collision
+
+The collision abstraction layer defines the interface that both the Projectile system and the Motion solver rely on. Two built-in implementations are provided.
+
+<Accordion title="Key Collision Types">
+
+| Type | Source | Role |
+|------|--------|------|
+| `ICollisionWorld` | `collision.abstractions` | Query interface: raycast, overlap, broad-phase |
+| `NaiveCollisionWorld` | `collision.abstractions` | O(N) brute-force; suitable for small entity counts |
+| `GridCollisionWorld` | `collision.abstractions` | Grid-bucketed broad-phase for larger worlds |
+| `GridBroadphase` | `collision.abstractions` | Spatial hash grid for fast neighbor queries |
+| OBB sweep | `collision.abstractions` | Oriented bounding box sweep for tight projectile accuracy |
+
+Projectile's `ProjectileWorld` accepts any `ICollisionWorld`. Swap implementations per-world-profile without changing any projectile logic.
+
+</Accordion>
+
+---
+
+## Navigation
+
+`GridPathfinder` implements deterministic integer A* on a `NavigationGrid`. All arithmetic uses integers, making results bitwise identical across client, server, and replay.
+
+<Accordion title="Key Navigation Types">
+
+| Type | Role |
+|------|------|
+| `NavigationGrid` | Walkability grid; cells marked blocked at startup |
+| `GridPathfinder` | A* over the grid; returns `List<GridCell>` path |
+| `INavigationWorld` | Abstraction consumed by AI and motion sources |
+
+</Accordion>
+
+---
+
+## Attributes and Modifiers
+
+The attribute system is a composable numeric engine. `AttributeRegistry` defines attribute metadata and builds a dependency graph; `AttributeGroup` holds per-entity instances; `ModifierCalculator` computes final values from stacked `ModifierData` entries.
+
+<Accordion title="Attributes Core Types">
+
+| Type | Source | Role |
+|------|--------|------|
+| `AttributeRegistry` | `com.abilitykit.attributes` | Registers `AttributeDef`, assigns IDs, builds dependency DAG via `Freeze()` |
+| `AttributeDef` | `com.abilitykit.attributes` | Name, group, default base value, `IAttributeFormula`, `IAttributeConstraint`, dependencies |
+| `AttributeContext` | `com.abilitykit.attributes` | World-level context; propagates dirty-marking to dependents on change |
+| `AttributeGroup` | `com.abilitykit.attributes` | Per-entity attribute instances, base values, modifier slots |
+| `AttributeInstance` | `com.abilitykit.attributes` | Single attribute; recomputes lazily via `ModifierCalculator` when dirty |
+| `DefaultAttributeFormula` | `com.abilitykit.attributes` | `FinalValue = modifierResult.FinalValue`; NaN/Inf → 0 |
+| `AttributeExpressionFormula` | `com.abilitykit.attributes` | RPN expression referencing `base`, `add`, `mul`, `override`, and other attribute IDs |
+| `RangeAttributeConstraint` | `com.abilitykit.attributes` | Clamps final value to `[min, max]` |
+
+</Accordion>
+
+<Accordion title="Modifiers Core Types">
+
+| Type | Source | Role |
+|------|--------|------|
+| `ModifierData` | `com.abilitykit.modifiers` | One modifier instance: `Key`, `Op`, `Priority`, `SourceId`, `Magnitude` |
+| `MagnitudeSource` | `com.abilitykit.modifiers` | Numeric source type: `Fixed`, `Scalable`, `Attribute`, `TimeDecay`, `Pipeline` |
+| `ModifierCalculator` | `com.abilitykit.modifiers` | Cache + compute entry point; delegates to `ModifierComputeCore` |
+
+```csharp
+// Add a flat attack bonus modifier from a buff
+var handle = attributeGroup.AddModifier(
+    attackId,
+    ModifierData.Add(value: 50f, sourceId: buffInstanceId, priority: 10));
+
+// Remove it when the buff expires
+attributeGroup.RemoveModifier(attackId, handle);
+```
+
+</Accordion>
+
+<Warning>
+`AttributeId` integer values depend on the registration order in `AttributeRegistry`. Do not persist or network raw `AttributeId` values. Use stable string names in protocol/save formats and map them back at startup.
+</Warning>
+
+---
+
+## Design Principle: Pure C#, No Dependencies
+
+All eight primitive packages share one design constraint: **they must compile and run as pure .NET class libraries** without any reference to `UnityEngine`, ECS runtime, or frame-sync infrastructure. This means:
+
+- They are testable with standard xUnit/NUnit without a Unity player loop.
+- They can run on a headless Linux dedicated server without modification.
+- Frame-sync rollback is implemented by adapter types (`ProjectileRollbackProvider`, etc.) that wrap the core, not by core types depending on rollback.
+- ECS is an opt-in host layer; the combat primitives themselves use plain C# classes and interfaces.

@@ -1,0 +1,195 @@
+---
+title: "Buff & Continuous: Lifecycle-Managed Persistent Behaviors"
+sidebarTitle: "Buff & Continuous"
+description: "How com.abilitykit.continuous manages condition-driven activation, blocking, pausing, resuming, and termination for any sustained game behavior."
+---
+
+A timer that counts down and applies damage every second is straightforward. A behavior that must only be active while the owner lacks a blocking tag, suspends when a higher-priority effect takes hold, resumes when that effect ends, and terminates cleanly at a precise moment — that is what the `com.abilitykit.continuous` package provides. **Continuous** is a lifecycle contract for any sustained game state: Buff, passive skill, motion source, aura, guided behavior, or anything else with a beginning, middle, and end that needs external management.
+
+## Package
+
+`com.abilitykit.continuous`
+
+## The Core Interfaces
+
+The public package surface is intentionally narrow. Every project domain type — Buff, Passive, Motion continuous, etc. — implements `IContinuous` and registers with `IContinuousManager`. The framework manages the lifecycle; the domain implements the behavior.
+
+<Accordion title="IContinuous — Minimum Lifecycle Contract">
+
+```csharp
+// Source: com.abilitykit.continuous
+// Runtime/Continuous/IContinuous.cs
+
+public interface IContinuous
+{
+    IContinuousConfig Config { get; }
+
+    ContinuousState State { get; }
+    bool IsActive { get; }
+    bool IsTerminated { get; }
+    bool IsPaused { get; }
+    float ElapsedSeconds { get; }
+
+    void Activate();
+    void Pause();
+    void Resume();
+    void End(ContinuousEndReason reason);
+    void Abort(string reason);
+
+    event Action<IContinuous, ContinuousEndReason> OnEnded;
+}
+```
+
+</Accordion>
+
+<Accordion title="IContinuousConfig — Minimum Configuration">
+
+```csharp
+// Source: com.abilitykit.continuous
+// Runtime/Continuous/IContinuousConfig.cs
+
+public interface IContinuousConfig
+{
+    string Id { get; }
+    long OwnerId { get; }
+    bool CanBeInterrupted { get; }
+}
+```
+
+Optional extensions are implemented per-need: `IDurationConfig` (duration seconds), `IStackConfig` (stack/maxStack), `ITagConfig` (self-tags, pause-by-tags, block-by-tags), `IMutexConfig` (mutex group and priority), `IHierarchyConfig` (parent/child cascade).
+
+</Accordion>
+
+<Accordion title="IContinuousManager — Lifecycle Management">
+
+```csharp
+// Source: com.abilitykit.continuous
+// Runtime/Continuous/IContinuousManager.cs
+
+public interface IContinuousManager
+{
+    bool Register(IContinuous continuous);
+    void Unregister(IContinuous continuous, ContinuousEndReason reason = ContinuousEndReason.CleanedUp);
+
+    bool TryActivate(IContinuous continuous);
+    bool TryPause(IContinuous continuous);
+    bool TryResume(IContinuous continuous);
+    bool TryEnd(IContinuous continuous, ContinuousEndReason reason = ContinuousEndReason.Completed);
+    bool TryInterrupt(IContinuous continuous, string reason);
+
+    void InterruptAll(long ownerId, string reason);
+    void PauseAll(long ownerId);
+    void ResumeAll(long ownerId);
+
+    IReadOnlyList<IContinuous> GetOwnerContinuous(long ownerId);
+    IReadOnlyList<IContinuous> GetOwnerActiveContinuous(long ownerId);
+
+    int ActiveCount { get; }
+    int TotalCount { get; }
+}
+```
+
+</Accordion>
+
+## The Five Lifecycle States
+
+<Tabs>
+  <Tab title="Active">
+    The continuous is registered, has passed admission checks, and is running. `ElapsedSeconds` advances each tick. Components, modifiers, and interval effects are active. `IsActive == true`.
+  </Tab>
+  <Tab title="Blocked">
+    Registration was attempted but an `IContinuousAdmissionPolicy` rejected it — typically because a conflicting tag is present (`BlockByTags`). No instance is created. The effect is silently dropped until the blocking condition is resolved and Apply is retried.
+  </Tab>
+  <Tab title="Paused">
+    Active but suspended. `ElapsedSeconds` does not advance. Modifier projections remain applied. `IsPaused == true`, `State == Active` (the state enum does not have a separate `Paused` value in `DefaultContinuousManager`).
+  </Tab>
+  <Tab title="Resumed">
+    A previously paused continuous has had `TryResume` called. Execution resumes from where it left off. Interval timers, duration countdowns, and Tick processors all continue from their paused values.
+  </Tab>
+  <Tab title="Terminated">
+    The continuous has ended via `TryEnd`, `TryInterrupt`, or `Abort`. `OnEnded` is fired, the manager removes it from the active list, and `Unregister` is called in `finally`. `IsTerminated == true`. No further callbacks fire.
+  </Tab>
+</Tabs>
+
+## How Continuous Differs from a Simple Timed Buff
+
+A plain timed buff ticks down and removes itself. `IContinuous` adds:
+
+| Capability | Simple Timer | IContinuous |
+|-----------|--------------|-------------|
+| Admission gate (tag-based blocking) | ❌ | ✅ via `IContinuousAdmissionPolicy` |
+| Pause / Resume with state preservation | ❌ | ✅ |
+| Tag-driven automatic pause (`PauseByTags`) | ❌ | ✅ via `ITagConfig` |
+| Mutual exclusion group | ❌ | ✅ via `IMutexConfig` |
+| Hierarchical cascade on expire | ❌ | ✅ via `IHierarchyConfig` |
+| Lifecycle binder hooks (OnActivated, OnEnded) | ❌ | ✅ via `IContinuousLifecycleBinder` |
+| Owner-indexed batch operations | ❌ | ✅ `InterruptAll(ownerId)`, `PauseAll(ownerId)` |
+| Registration-phase rollback on binder failure | ❌ | ✅ `DefaultContinuousManager` reverts and compensates |
+
+## Admission and Lifecycle Binders
+
+Two extension points integrate seamlessly into `DefaultContinuousManager`:
+
+```csharp
+// IContinuousAdmissionPolicy — checked on Register and TryActivate
+public interface IContinuousAdmissionPolicy
+{
+    bool CanRegister(IContinuous continuous, IContinuousManager manager, out string? reason);
+    bool CanActivate(IContinuous continuous, IContinuousManager manager, out string? reason);
+}
+
+// IContinuousLifecycleBinder — called at each state transition
+public interface IContinuousLifecycleBinder
+{
+    void OnRegistered(IContinuous continuous, IContinuousManager manager);
+    void OnActivated(IContinuous continuous, IContinuousManager manager);
+    void OnPaused(IContinuous continuous, IContinuousManager manager);
+    void OnResumed(IContinuous continuous, IContinuousManager manager);
+    void OnEnded(IContinuous continuous, ContinuousEndReason reason, IContinuousManager manager);
+    void OnUnregistered(IContinuous continuous, ContinuousEndReason reason, IContinuousManager manager);
+}
+```
+
+Registration is the only phase with partial rollback: if a binder's `OnRegistered` throws, the manager reverts its internal indexes, unsubscribes from `OnEnded`, and calls `OnUnregistered(CleanedUp)` on already-executed binders in reverse order. Binder failures in `OnActivated`, `OnEnded`, and `OnUnregistered` do not roll back committed manager state.
+
+## Integration with GameplayTags
+
+When a continuous implements `ITagConfig`, the MOBA demo's `MobaContinuousTagRuleService` evaluates:
+
+- **BlockByTags**: if a current owner tag matches, `TryActivate` returns false.
+- **PauseByTags**: if a current owner tag matches, the continuous is paused automatically by the reconcile system.
+- **Ongoing required tags** (project-level): if a tag the continuous depends on disappears, the reconcile system calls `TryEnd(Interrupted)`.
+
+This tag-driven lifecycle means game designers can express "this Buff cannot be active while the target is immune to crowd control" purely as a tag rule, without any imperative code.
+
+## Five Reference Runtime Types (MOBA Application Layer)
+
+The MOBA demo provides five domain `IContinuous` implementations as high-quality reference compositions. These are **application-layer examples**, not public framework API.
+
+| Runtime Type | Domain Role | Notable Capabilities |
+|-------------|-------------|---------------------|
+| `BuffContinuousRuntime` | Buff duration, intervals, modifier projection | `IStackConfig`, interval effects, `MobaAttributeContinuousModifierProjector` |
+| Passive Continuous | Passive skill active period | Owner-bound `TriggerPlan` subscription lifecycle |
+| `MobaMotionContinuousRuntime` | Displacement skill (dash, knock, pull) | Priority motion source, collision constraint, rollback token |
+| Projectile Continuous | Continuous tracking projectile lifecycle | Bind to `ProjectileWorld` active span |
+| Summon Continuous | Summoned entity lifetime | Parent-skill retain, cascade terminate on caster death |
+
+Your project should compose its own domain types using the same pattern: implement `IContinuous` (optionally via `MobaContinuousRuntimeBase`), declare optional config interfaces, and register with `IContinuousManager`.
+
+<Warning>
+`DefaultContinuousManager` does not own a tick. Duration countdown, interval firing, modifier re-projection, and tag reconciliation are **not** automatic. Your project must drive these in a fixed-order system (e.g., `ContinuousTick < BuffLifecycleReconcile < OngoingTriggerPlansReconcile`). The MOBA `MobaContinuousTickSystem` is a reference implementation of the tick driver.
+</Warning>
+
+## Ownership and Cleanup Rules
+
+<Accordion title="Clear vs. Shutdown">
+`IContinuousManager.Clear(CleanedUp)` unregisters all entries but does **not** call `End` or `Abort` on them. Objects may still hold `Active` state even though the manager no longer references them. For a proper world shutdown: collect all active instances first, end or interrupt them explicitly, then clear any residual registrations.
+</Accordion>
+
+<Accordion title="OwnerId Immutability">
+`Config.OwnerId` must not change after registration. The manager uses it to build and tear down owner buckets. If the value changes while registered, the reverse-lookup during `Unregister` will fail to locate the entry in the correct bucket.
+</Accordion>
+
+<Accordion title="GetOwnerContinuous Live View">
+`GetOwnerContinuous(ownerId)` returns a live wrapper of the internal owner list — not a snapshot. Do not enumerate it while any code path could simultaneously register or unregister entries for that owner. Use `GetOwnerActiveContinuous(ownerId)` when you need a safe snapshot.
+</Accordion>

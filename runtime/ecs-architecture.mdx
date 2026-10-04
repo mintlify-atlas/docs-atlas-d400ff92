@@ -1,0 +1,221 @@
+---
+title: "ECS Architecture: Built-in, Entitas, and Svelto Backends"
+sidebarTitle: "ECS Architecture"
+description: "AbilityKit's three ECS backends: EntityWorld, Entitas, and Svelto. Covers versioned IEntityId, ComponentRegistry, component indexing, and query iteration."
+---
+
+AbilityKit does not mandate a single ECS implementation. Instead it provides three ECS backends that share the same world lifecycle contract (`IWorld`) but diverge entirely in how entities, components, and systems are organized. Choosing a backend is a project-level decision: the three are not transparently interchangeable, and mixing them requires explicit adapters. The built-in `EntityWorld` is used in framework tests and the MOBA Console Demo; Entitas is the backbone of the MOBA Unity Demo; Svelto powers the Shooter Demo.
+
+<Note>
+  The three ECS backends are **not** transparently interchangeable. A project must explicitly choose one and wire it up through its world factory and modules. There is no runtime-swappable ECS abstraction in the framework.
+</Note>
+
+## Built-in EntityWorld
+
+`EntityWorld` (package `com.abilitykit.world.ecs`) is the framework's lightweight, dependency-free ECS. It targets scenarios where you want entity/component storage without pulling in Entitas or Svelto: unit tests, Console Demos, server-side logic, and as an approachable learning target.
+
+### Internal Storage
+
+Rather than giving each entity a C# object, `EntityWorld` uses parallel arrays indexed by slot position:
+
+| Field | Purpose |
+|---|---|
+| `_versions` | Per-slot version counter — incremented on destroy, enabling safe reuse |
+| `_alive` | Per-slot liveness flag |
+| `_components` | `object[][]` — each entity gets an array of component slots indexed by `ComponentTypeId` |
+| `_componentIndex` | `Dictionary<int, HashSet<int>>` — maps type ID → set of entity indices for fast query entry |
+| `_parentIndex` / `_children` | Parent/child hierarchy for recursive destroy and logical child ID lookup |
+| `_freeIndices` | Stack of recycled slot indices |
+| `_listPool` | Pooled temporary lists for queries and recursive destroy |
+
+### IEntity and IEntityId
+
+`IEntity` is a **readonly struct** (a value-type handle), not a heap object. All actual state lives inside `EntityWorld`.
+
+`IEntityId` pairs an `Index` (array slot) with a `Version` (lifetime counter). When a slot is reused after destruction, the version increments — so any stale handle holding the old `(Index, Version)` will fail the `IsAlive` check and never accidentally address the new occupant.
+
+```csharp
+public readonly struct IEntityId : IEquatable<IEntityId>, IComparable<IEntityId>
+{
+    public readonly int Index;
+    public readonly int Version;
+
+    public bool IsValid => Index >= 0;
+}
+```
+
+### Component Registry
+
+`ComponentRegistry` maps `System.Type` to a sequential integer `typeId`. The default `ComponentRegistry.Shared` singleton ensures that multiple `EntityWorld` instances in the same process assign the same `typeId` to the same component type — important for cross-world diagnostics and event routing.
+
+```csharp
+public sealed class ComponentRegistry : IComponentRegistry
+{
+    private readonly Dictionary<Type, int> _ids = new Dictionary<Type, int>();
+    private int _nextId = 1;
+
+    public int GetId(Type type)
+    {
+        if (_ids.TryGetValue(type, out var id)) return id;
+        id = _nextId++;
+        _ids.Add(type, id);
+        return id;
+    }
+}
+```
+
+<Warning>
+  Component type IDs are assigned in first-access order at runtime. They must not be written to persistent storage, network packets, or used as cross-process identifiers. They are process-internal indexes only.
+</Warning>
+
+### EntityQuery and Iteration
+
+The code below is taken directly from the framework source and shows the full built-in ECS pattern:
+
+```csharp
+public struct Position { public float X; public float Z; }
+public struct MoveSpeed { public float Value; }
+
+var world = new EntityWorld();
+
+var actor = world.Create("Actor_1")
+    .With(new Position { X = 0f, Z = 0f })
+    .With(new MoveSpeed { Value = 5f });
+
+world.Query<Position, MoveSpeed>().ForEach((entity, position, speed) =>
+{
+    position.X += speed.Value * 0.033f;
+    entity.With(position);   // write struct back after mutation
+});
+
+actor.Destroy();
+```
+
+`Query<T1, T2>()` returns a thin `EntityQuery<T1, T2>` struct. The real work happens inside `ForEach()`, which calls `QueryImpl`:
+
+1. Fetches the candidate set from `_componentIndex[typeId1]` (the first component is the entry point — put the rarer component first for smaller candidate sets).
+2. Copies the candidate indices into a pooled snapshot list to prevent collection-modification exceptions if the visitor adds or removes components.
+3. For each candidate: verifies the slot is alive and the version matches, checks that all required component slots are occupied, then invokes the visitor.
+
+Queries support 1, 2, or 3 component types. `Count()` and `Any()` are convenience wrappers over `ForEach` and have the same linear cost — they do not read a cached counter.
+
+### Parent/Child Relationships and World Events
+
+`EntityWorld` maintains a parent–child hierarchy internally. APIs include `CreateChild(parent)`, `SetParent(child, parent)`, `TryGetChildById(parent, logicalChildId, out child)`, and `DestroyRecursive(id)`. This hierarchy expresses logical entity organization (actor → attached hitbox, or battle root → all actors), not Unity Transform hierarchy.
+
+The world publishes strongly-typed events — `EntityCreated`, `EntityDestroyed`, `ComponentSet`, `ComponentRemoved`, `ParentChanged` — via `IWorldEventBus`. Presentation layers, debug tools, and snapshot systems subscribe to these events rather than polling.
+
+## ECS Backend Comparison
+
+<Tabs>
+  <Tab title="Built-in EntityWorld">
+    **Package:** `com.abilitykit.world.ecs`
+
+    **Used by:** Framework tests, MOBA Console Demo, server-side logic, lightweight tooling.
+
+    **Strengths:**
+    - No third-party dependency — works in any C# environment.
+    - Minimal setup: `new EntityWorld()` and start creating entities.
+    - Full source is shared between Unity and .NET builds.
+    - Built-in parent/child hierarchy and world event bus.
+    - Predictable semantics — good for deterministic simulation and replay.
+
+    **Limitations:**
+    - Components stored in `object[][]` — struct components are boxed on write.
+    - Query API limited to 1–3 component types natively.
+    - No reactive/group system; systems must pull-query each tick.
+    - Single-threaded: no concurrent Create/Destroy/Query support.
+  </Tab>
+  <Tab title="Entitas">
+    **Package:** `com.abilitykit.world.entitas`
+
+    **Used by:** MOBA Unity Demo, any project with generated Entitas contexts.
+
+    **Strengths:**
+    - Mature ecosystem with code-generation tooling for context and component boilerplate.
+    - Group/reactive system pattern: `WorldSystemBase` implements `IInitializeSystem` / `IExecuteSystem` / `ICleanupSystem` / `ITearDownSystem`.
+    - `AutoSystemInstaller` discovers `[WorldSystem]`-attributed classes and installs them in Phase/Order/FullName order.
+    - Deep integration with World DI: systems receive `IContexts` and `IWorldResolver` through a required constructor signature.
+
+    **Limitations:**
+    - Requires Entitas code generation — generated contexts are project-specific.
+    - Entitas `1.5.0` resolves to `1.13.0` in the current .NET build, with compatibility warnings.
+    - Not interchangeable with the built-in ECS without re-implementing entity/component APIs.
+  </Tab>
+  <Tab title="Svelto">
+    **Package:** `com.abilitykit.world.svelto` (via `com.abilitykit.thirdparty.*`)
+
+    **Used by:** Shooter Demo, high-performance simulation scenarios.
+
+    **Strengths:**
+    - Deterministic, jobs-oriented ECS with structured `ExclusiveGroupStruct` entity layout.
+    - `EnginesRoot` manages engine lifecycle; `EntitiesDB` provides structured component access.
+    - Batched structural-change submission via `EntitiesSubmissionScheduler` keeps write-then-query boundaries explicit.
+    - Used in Shooter for snapshot hash, rollback, and RVO navigation.
+
+    **Limitations:**
+    - Structural changes (create/delete/move) require an explicit `SubmitEntities()` call before they are visible in queries.
+    - `EntitiesDB` is exposed via an internal `IUnitTestingInterface.entitiesForTesting` member — Svelto version upgrades are a migration risk.
+    - Replacing the default context requires overriding all seven registered DI services, not just the interface.
+  </Tab>
+</Tabs>
+
+## Entitas Adapter Deep Dive
+
+### WorldSystemBase Lifecycle
+
+Every Entitas-backed system in AbilityKit extends `WorldSystemBase`, which wraps the four Entitas lifecycle interfaces into protected overridable methods:
+
+| Entitas interface | WorldSystemBase callback | Notes |
+|---|---|---|
+| `IInitializeSystem.Initialize()` | `OnInit()` | Resolve services, create Entitas groups |
+| `IExecuteSystem.Execute()` | `CanExecute()` → `OnExecute()` | Main per-tick logic |
+| `ICleanupSystem.Cleanup()` | `OnCleanup()` | End-of-tick cleanup |
+| `ITearDownSystem.TearDown()` | `OnTearDown()` | Always called, even when `Enabled = false` |
+
+```csharp
+protected WorldSystemBase(global::Entitas.IContexts contexts, IWorldResolver services)
+{
+    Contexts = contexts ?? throw new ArgumentNullException(nameof(contexts));
+    Services = services ?? throw new ArgumentNullException(nameof(services));
+}
+```
+
+### Phase and Order
+
+`AutoSystemInstaller` scans assemblies for `[WorldSystem]`-attributed classes and sorts them deterministically:
+
+1. `WorldSystemPhase` (`PreExecute = 0`, `Execute = 1`, `PostExecute = 2`).
+2. `Order` integer within the phase.
+3. `Type.FullName` as a stable tiebreaker.
+
+`WorldSystemOrder` provides conventional spacing constants (`ModuleStep = 1000`, `Early = 100`, `Normal = 500`, `Late = 900`).
+
+### EntitasWorldComposer
+
+Before installing systems, the composer enforces module governance: deduplication, conflict detection, dependency existence, topological sort, and cycle detection. This lets complex gameplay modules declare their dependencies declaratively rather than relying on registration order.
+
+## Svelto Adapter: SveltoCompositionRoot and EngineRootWrapper
+
+`SveltoWorldModule` registers all Svelto runtime objects as world-scoped singletons through `WorldContainerBuilder.TryRegister`:
+
+```
+SveltoWorldContext
+  ├── EnginesRoot           (add engines, manage engine lifecycle)
+  ├── EntitiesSubmissionScheduler  (batch and commit structural changes)
+  ├── EntitiesDB            (query component arrays by group)
+  ├── IEntityFactory        (build entities with descriptors)
+  └── IEntityFunctions      (delete, swap group, modify entity lifecycle)
+```
+
+The Shooter Demo's `ShooterEntityManager` wraps factory and functions with a `BeginStructuralChanges / EndStructuralChanges` depth counter, batching multiple creates/deletes into a single `SubmitEntities()` call at the outermost boundary.
+
+## Design Principles
+
+<Accordion title="Why three backends instead of one abstraction?">
+  A single unified ECS abstraction would force all three backends to expose a common API surface, inevitably limiting each to the lowest common denominator. AbilityKit's approach lets the Entitas adapter preserve reactive groups and code generation, the Svelto adapter preserve its structured-group and submission semantics, and the built-in adapter remain zero-dependency. The `IWorld` contract is the unification point — not the ECS query API.
+</Accordion>
+
+<Accordion title="Why does EntityWorld box struct components?">
+  Storing components in `object[][]` was chosen for simplicity and flexibility: value-type and reference-type components share one storage path, and the API stays generic without additional codegen. For hot paths in large-scale simulations, Svelto's native struct arrays provide the alternative. The built-in ECS is optimized for correctness and ease of use, not maximum throughput.
+</Accordion>

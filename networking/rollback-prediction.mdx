@@ -1,0 +1,161 @@
+---
+title: "Rollback and Prediction Infrastructure in AbilityKit"
+sidebarTitle: "Rollback & Prediction"
+description: "RollbackCoordinator, IRollbackStateProvider, ProjectileRollbackProvider — AbilityKit rollback primitives for frame sync and state sync prediction."
+---
+
+Rollback and prediction in AbilityKit is not a single algorithm — it is a set of infrastructure primitives that projects compose. The framework provides snapshot capture, ring-buffer storage, provider registration, reconciliation coordination, and replay mechanics. Projects supply the business state by implementing `IRollbackStateProvider`, decide which entities are eligible for prediction, and own the reconciliation policy that maps divergence to corrective action. Both the MOBA demo (frame sync, fine-grained providers) and the Shooter demo (state sync, packed snapshot provider) use this infrastructure in different ways.
+
+## Relevant Packages
+
+- **`com.abilitykit.world.statesync`** — `PredictionCoordinator`, `ClientPredictionReconciliationCoordinator`, `StateSlots`, `InputHistory`, `DictionarySnapshotStore`
+- **`com.abilitykit.world.framesync`** — `IRollbackStateProvider`, `RollbackRegistry`, `RollbackCoordinator`, `RollbackSnapshotRingBuffer`, `InputHistoryRingBuffer`, `ClientPredictionReconciler`, `ClientPredictionRunner`, `ClientPredictionDriverModule`
+- **`com.abilitykit.combat.projectile`** — `ProjectileRollbackProvider`
+
+## How Client Prediction Works
+
+The prediction loop has four phases:
+
+<Steps>
+  <Step title="Predict Locally">
+    The client submits a local input to `IWorldInputSink` (frame sync) or calls `PredictionCoordinator.ProcessInput` (state sync). The world advances one local frame. `RollbackCoordinator.CaptureAndStore(frame)` snapshots all registered providers and stores the snapshot in the ring buffer at index `frame % capacity`.
+  </Step>
+  <Step title="Record Predicted Hash">
+    After the local tick, the client computes a state hash covering the entities it predicted and stores it in `WorldStateHashRingBuffer` via `ClientPredictionReconciler.RecordPredictedHash(frame, hash)`.
+  </Step>
+  <Step title="Receive Authoritative State">
+    The server delivers either an authoritative input batch (frame sync) or an authoritative snapshot/hash (state sync). `ClientPredictionReconciler.OnAuthoritativeHash(frame, authoritativeHash)` compares the two hashes. A mismatch fires `OnRollbackRequested(frame)`.
+  </Step>
+  <Step title="Rollback and Replay">
+    `RollbackCoordinator.TryRestore(frame - 1)` restores the world to the frame before divergence. The client then replays frames using authoritative inputs until it reaches the target frame, recapturing snapshots along the way. If authoritative inputs are missing, the driver waits and eventually disables reconciliation to prevent an infinite replay loop.
+  </Step>
+</Steps>
+
+## `PredictionCoordinator`
+
+`PredictionCoordinator` is located at:
+
+```
+Unity/Packages/com.abilitykit.world.statesync/Runtime/StateSync/Prediction/Core/PredictionCoordinator.cs
+```
+
+It manages the state sync prediction loop. The public interface is:
+
+```csharp
+public interface IPredictionCoordinator
+{
+    void ProcessInput(PlayerInputCommand command);
+    void ProcessInputs(IReadOnlyList<PlayerInputCommand> commands);
+    void ApplyServerSnapshot(FrameIndex serverFrame, StateSlots serverSlots, string objectId);
+    void Reset();
+}
+```
+
+`ProcessInputs` advances the prediction frame once and applies all commands from the batch at that frame, then records a single frame-end snapshot. This correctly handles the case where a player issues multiple commands in one frame (e.g., simultaneous move + cast).
+
+`ApplyServerSnapshot` performs the reconciliation sequence:
+1. Reads the stored predicted snapshot for `serverFrame`.
+2. Calls `ValidateAll(predicted, server)` — if `ConflictLevel.None`, advances `confirmedFrame` and returns.
+3. On conflict: overwrites `currentSlots` with server state, sets `confirmedFrame`, calls `PruneBefore(serverFrame)`, clears input history, then calls `ReplayInputFrames` using the complete frame batch list captured before clearing.
+
+`DictionarySnapshotStore.Record` and `.Get` both return independent clones. Mutable reference-type slot values require a project-supplied `IStateSlotValueCloner`; the coordinator fails fast (rather than silently shallow-copying) if a cloner is absent. `Reset()` clears frame counters, input history, snapshot store, and current slots; `Dispose()` additionally unregisters handlers and listeners.
+
+## Per-Entity Rollback vs. ECS Rollback
+
+AbilityKit supports two patterns for organizing rollback state:
+
+**Fine-grained per-domain providers** (MOBA pattern) — Multiple `IRollbackStateProvider` implementations each capture a specific state domain: transform, HP, resource, buff timers, cooldowns, state machine, random seed, skill runtime, and so on. `MobaRollbackRegistryBuilder` registers all of these providers in a fixed Key-sorted order. This approach is precise but requires every domain that influences future simulation to have its own provider.
+
+**Packed snapshot provider** (Shooter pattern) — A single `ShooterPackedSnapshotRollbackProvider` captures and restores the entire world state in one call using the same binary codec used for network snapshots:
+
+```csharp
+public sealed class ProjectileRollbackProvider : IRollbackStateProvider
+{
+    public const int DefaultKey = 12001;
+
+    private readonly IProjectileService _projectiles;
+
+    public ProjectileRollbackProvider(IProjectileService projectiles)
+    {
+        _projectiles = projectiles ?? throw new ArgumentNullException(nameof(projectiles));
+    }
+
+    public int Key => DefaultKey;
+
+    public byte[] Export(FrameIndex frame)
+    {
+        return _projectiles.ExportRollback(frame);
+    }
+
+    public void Import(FrameIndex frame, byte[] payload)
+    {
+        _projectiles.ImportRollback(frame, payload);
+    }
+}
+```
+
+`ProjectileRollbackProvider` (key `12001`) delegates to `IProjectileService.ExportRollback` and `ImportRollback`. It plugs into the same `RollbackRegistry` and `RollbackCoordinator` infrastructure as any other provider.
+
+## `RollbackCoordinator`: Capture, Store, and Restore
+
+`RollbackCoordinator` orchestrates the snapshot lifecycle. `RollbackRegistry` collects providers, sorts them by `Key` for deterministic ordering, and seals itself when the coordinator is constructed (preventing runtime registration changes from causing snapshot incompatibility).
+
+```csharp
+// Capture frame 42 across all registered providers
+var result = coordinator.CaptureAndStore(new FrameIndex(42));
+
+// Restore frame 41 (the frame before the divergence point)
+var restoreResult = coordinator.TryRestore(new FrameIndex(41));
+
+if (restoreResult.Status == RollbackOperationStatus.Succeeded)
+{
+    // Replay frames 42..currentPredictedFrame with authoritative inputs
+}
+```
+
+The coordinator uses `ArrayPool<WorldRollbackSnapshotEntry>.Shared` for capture buffers to minimize allocation on hot paths. `RollbackOperationResult` exposes the operation type, status, provider key, payload bytes, and any exception — useful for both logging and automated test assertions.
+
+**Important**: `Restore` is not a transaction. The coordinator resolves all provider keys first, then calls `Import` sequentially. If a later provider's `Import` throws, earlier providers have already been restored to the target frame. Treat any `ProviderFailed` result as a partial restore and fall back to requesting a full authoritative baseline.
+
+## What the Framework Provides vs. What Projects Define
+
+| Responsibility | Framework | Project |
+|---|---|---|
+| Prediction slots and history storage | `PredictionCoordinator`, `StateSlots`, `DictionarySnapshotStore` | — |
+| Snapshot capture and ring-buffer storage | `RollbackCoordinator`, `RollbackSnapshotRingBuffer` | — |
+| Reconciliation loop and state hash comparison | `ClientPredictionReconciler`, `ClientPredictionDriverModule` | — |
+| **Entity identity** for server snapshot matching | — | Define which `objectId` maps to the local player and which to remotes |
+| **Which components to snapshot** | — | Implement `IRollbackStateProvider.Export/Import` per state domain |
+| **Interpolation blend** after rollback | — | After `TryRestore`, call your view layer's `RebindAll` or sample reset |
+| **Hash computation** | — | Implement a stable, platform-consistent hasher covering all predicted fields |
+
+## Connection to the Shooter Demo's Authoritative Remote Client Hot Path
+
+In the Shooter demo, `ShooterClientFrameSyncController` creates a `RollbackRegistry`, registers `ShooterPackedSnapshotRollbackProvider`, and constructs a `RollbackCoordinator`. When a packed authoritative snapshot arrives:
+
+1. The controller records predicted frame/hash and authoritative frame/hash.
+2. It calls `ImportPackedSnapshotBytes` to apply the authoritative state.
+3. It replays remaining local pending inputs.
+4. It computes `runtime.StateHash` after replay and compares with the authoritative hash.
+5. On mismatch or import failure, it transitions to `CatchUp` or `AwaitingFullSnapshot` recovery states.
+6. After a full snapshot is applied, the controller also restores the reliable event baseline.
+
+This closed loop — packed snapshot for both rollback capture and network correction — demonstrates that state sync and rollback are complementary, not mutually exclusive. The same binary codec serves both paths.
+
+<Tip>
+When first integrating rollback, start with **state hash validation only** before implementing full snapshot capture. Register a minimal `IRollbackStateProvider` for your most divergence-sensitive state domain (e.g., player position), implement a stable hasher, and observe how frequently `OnRollbackRequested` fires in a realistic session. This gives you measurable data before investing in complete provider coverage across all state domains.
+</Tip>
+
+## Key Constraints
+
+<Accordion title="Provider Key stability">
+Every `IRollbackStateProvider` must use a globally stable, non-conflicting `Key` integer. `RollbackRegistry` sorts providers by `Key` and seals at construction time. If client and server use different Key values for the same domain, restore will silently apply the wrong payload to the wrong provider. Assign fixed numeric Key ranges to each module (e.g., transform at `1000`, HP at `1001`, projectiles at `12001`).
+</Accordion>
+
+<Accordion title="Ring buffer capacity">
+`RollbackSnapshotRingBuffer` stores `capacity` frames in a fixed array using `frame % capacity` as the slot index. Frames older than `capacity` frames are silently overwritten. Set `rollbackHistoryFrames` to cover at least `maxPredictionWindow + maxNetworkJitter + snapshotDeliveryDelay` frames. MOBA's `RemoteDrivenRuntimeModuleFactory` uses 240 frames (at 20 fps = 12 seconds of history) as a starting point.
+</Accordion>
+
+<Accordion title="Provider coverage completeness">
+The rollback is only as correct as the providers are complete. Omitting a state domain that influences future simulation (cooldowns, random seed, Buff timers, command/event log) means the replayed simulation will still diverge from the authoritative one. After implementing providers, write isolated determinism tests: run N frames, capture rollback state at frame M, replay from M, and assert that the simulation hash matches a reference run.
+</Accordion>

@@ -1,0 +1,187 @@
+---
+title: "MOBA Demo: Complete Combat Domain Integration Sample"
+sidebarTitle: "MOBA Demo"
+description: "Explore skill pipeline, Buff, projectiles, damage, Entitas ECS, Luban config, and BT AI across the MOBA demo's Unity and Console entry points."
+---
+
+The MOBA demo is AbilityKit's most comprehensive project-level reference. It wires together the full combat domain — skill input, Pipeline, TriggerPlan, Buff/Continuous behaviours, projectiles, area effects, damage, motion, navigation, behaviour-tree AI, presentation cues, config loading, and Entitas ECS — into a runnable battle that you can launch from either a Unity scene or the pure .NET Console Demo process. The purpose is to show how AbilityKit's mechanisms compose into a real game, not to provide a framework you must inherit.
+
+<Warning>
+Hero rules, blueprint field choices, Entitas system ordering, and config schema are **MOBA application decisions**. They reflect one team's implementation of a MOBA game and should not be treated as framework defaults. New games should copy the layering approach and reuse the public framework packages, then own their own application-layer types.
+</Warning>
+
+## Entry Points
+
+The MOBA demo has two runnable entry points that share the same MOBA runtime world:
+
+<CardGroup cols={2}>
+  <Card title="Unity — MobaDemoGameplayScene" icon="unity">
+    Loaded via `StarterScene.unity` → `DemoGameplayBootstrap` → `MobaDemoRoot` prefab → `GameEntry`. Supports Local and Multiplayer profiles. The `RemoteDrivenWorldRuntimeFactory` handles client prediction and rollback when a Gateway is present.
+  </Card>
+  <Card title="Console Demo" icon="terminal">
+    The `ConsoleBattleBootstrapper` in `src/AbilityKit.Demo.Moba.Console` assembles the MOBA runtime world through the same `WorldManager` / `MobaWorldBootstrapModule` pipeline as Unity, but runs in a pure .NET process. This is the primary CI validation path.
+  </Card>
+</CardGroup>
+
+## Project-Layer Types
+
+These types belong to the MOBA application layer — they are **not** public framework API:
+
+| Type | Role |
+|---|---|
+| `MobaSkillCastRuntimeService` | Runtime coordination for skill cast preparation, validation, and execution |
+| `SkillCastCoordinator` | Primary skill-release orchestrator — resolves slot → skill ID → pipeline → runner |
+| `MobaBattleWorldBlueprint` | Declares `WorldType = "battle"`, enables Entitas and BattleRuntime features, installs `MobaWorldBootstrapModule` |
+| `MobaTargetQueryFactories` | Project-defined factories for skill target queries |
+| `MobaDamageService` | Applies damage/heal to HP attributes and emits damage-event snapshots |
+| `MobaConfigDatabase` | Unified config facade wrapping Luban/DTO/Resources/Bytes sources |
+
+## Capability Areas
+
+<Accordion title="Skill Flow">
+
+Input arrives as `PlayerInputCommand` frames at `MobaInputCoordinator`, which routes each command to `SkillCastCoordinator`. The coordinator resolves the skill slot against `MobaSkillLoadoutService`, runs pre-cast checks via `SkillCastPreparationService` (cooldown, resource cost, target validity, interrupt policy), looks up the skill pipeline in `IMobaSkillPipelineLibrary`, then creates or updates the running skill state in `SkillRunnerRegistry`.
+
+The `SkillCastPolicy` struct controls parallelism and interruption:
+
+```csharp
+public readonly struct SkillCastPolicy
+{
+    public bool AllowParallel { get; }
+    public bool InterruptRunning { get; }
+}
+```
+
+Pipeline phases carry TriggerPlan actions that call combat services (Buff, Projectile, Damage, Summon) at the appropriate lifecycle points. The Triggering layer fires owner-bound subscriptions and runtime validators. Presentation cues are emitted alongside effect actions so the view layer receives timing-accurate signals without polling logic state.
+
+**Key sources:**
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Skill/Cast/SkillCastCoordinator.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Input/MobaInputCoordinator.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Triggering/MobaTriggerExecutionGateway.cs`
+
+</Accordion>
+
+<Accordion title="Combat — Buff, Projectile, Damage">
+
+All three combat services share a consistent pattern: requests enter a command queue, the queue drains to a lifecycle executor, and results are emitted as snapshots.
+
+**Buff (`MobaBuffService`):** `ApplyBuffImmediate` and `RemoveBuffImmediate` always enqueue before draining, ensuring a single lifecycle path. A `_draining` guard prevents recursive re-entry during effect execution. `ReconcileActorBuffLifecycles` runs each frame to expire and interrupt buffs whose tag conditions no longer hold.
+
+**Projectile (`MobaProjectileService`):** Converts MOBA config emitter specs into `ProjectileSpawnParams` for `IProjectileService`, creates a MOBA Actor for presentation sync, and links projectile ID to actor ID via `MobaProjectileLinkService`. The `MobaTeamProjectileHitFilter` blocks friendly-fire by default while allowing neutral targets.
+
+**Damage (`MobaDamageService`):**
+
+```csharp
+public float ApplyDamage(int attackerActorId, int targetActorId, int damageType, float value,
+    int reasonKind = 0, int reasonParam = 0);
+public float ApplyHeal(int healerActorId, int targetActorId, int healType, float value,
+    int reasonKind = 0, int reasonParam = 0);
+```
+
+Validates combat eligibility via `MobaCombatRulesService`, modifies `MobaAttrs` HP, then emits damage/heal snapshots via `MobaDamageEventSnapshotService`.
+
+**Key sources:**
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Buffs/MobaBuffService.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Projectile/MobaProjectileService.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Combat/MobaDamageService.cs`
+
+</Accordion>
+
+<Accordion title="Sync, Network, and Client Prediction">
+
+On the server side, `MobaActorTransformSnapshotService` inherits `LogicWorldSnapshotBufferEmitterBase` and emits actor positions as `WorldStateSnapshot` payloads each frame when `MobaLogicWorldRunGateService.InGame` is true.
+
+On the client side, `RemoteDrivenWorldRuntimeFactory` installs three modules:
+
+```csharp
+return new HostRuntimeModuleHost()
+    .Add(CreatePredictionModule(options))   // ClientPredictionDriverModule or remote-only
+    .Add(new ServerFrameTimeModule(options.FixedDelta))
+    .Add(new WorldAutoStartModule());
+```
+
+With prediction enabled, `ClientPredictionDriverModule` uses up to 30 frames of lookahead, 600 frames of rollback history, and per-frame state capture. `FrameSnapshotDispatcher` subscribes to `BattleLogicSession.FrameReceived` and routes each `WorldStateSnapshot` by OpCode through the `SnapshotPipeline` to ordered presentation stages.
+
+**Key sources:**
+- `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Application/Services/Actor/MobaActorTransformSnapshotService.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.view.runtime/Runtime/Game/Battle/Client/Session/Features/Sim/RemoteDrivenWorldRuntimeFactory.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.view.runtime/Runtime/Game/Battle/Client/Session/Features/Snapshot/FrameSnapshotDispatcher.cs`
+
+</Accordion>
+
+<Accordion title="Presentation">
+
+The presentation pipeline is deliberately decoupled from logic: the logic world only outputs OpCode + payload; the View Runtime decides how to decode, order, and render.
+
+`SnapshotPipeline` (from `com.abilitykit.world.snapshot`) provides ordered stages registered via:
+
+```csharp
+Register<T>(opCode, decoder)          // OpCode → typed payload decoder
+AddStage<T>(opCode, order, handler)   // Ordered presentation stage handler
+```
+
+MOBA registers its decoders and stages through `BattleSnapshotRegistry` and `SharedSnapshotRegistry`. In the Console Demo, `ConsoleBattleViewEventSink` handles the same OpCodes and drives text-mode rendering instead. This cross-platform snapshot consumption pattern is intentional — the same logic-world events reach both Unity and Console presentation layers through the same routing mechanism.
+
+**Key sources:**
+- `Unity/Packages/com.abilitykit.world.snapshot/Runtime/SnapshotRouting/SnapshotPipeline.cs`
+- `Unity/Packages/com.abilitykit.demo.moba.view.runtime/Runtime/Game/Battle/Client/Session/Features/Snapshot/BattleSnapshotRegistry.cs`
+- `src/AbilityKit.Demo.Moba.Console/View/ConsoleBattleViewEventSink.cs`
+
+</Accordion>
+
+<Accordion title="Config / Tooling — Luban Pipeline and BT AI">
+
+**Luban config pipeline:** Game designers author skill, buff, projectile, character, and area configuration in Excel. Luban converts these to binary bytes and generated C# classes. At runtime, `MobaConfigDatabase` wraps a `ConfigDatabase` and exposes multiple load paths:
+
+| Method | Source |
+|---|---|
+| `LoadFromBytes` / `ReloadFromBytes` | Binary asset packages |
+| `LoadFromResources` | Unity `Resources` folder |
+| `LoadFromDtoArrays` / `ReloadFromDtoArrays` | Batch DTO arrays |
+| `LoadFromTextSink` | Text asset sink (editor hot-reload) |
+
+A successful or failed reload publishes a result via `ConfigReloadBus`, letting gameplay services respond to hot-reloads without polling.
+
+**BT AI:** Hero and summon behaviours use JSON behaviour trees. The `generic_hero_combat_bt.json` drives standard hero combat logic (navigate → target → skill decision). `summon_warden_bt.json` handles the Summon Warden minion's patrol and attack loop. Both BTs consume `MobaEntityManager` indices for target selection and feed decisions into `SkillCastCoordinator`.
+
+**Console bootstrapper as pure-C# validation entry:** `ConsoleBattleBootstrapper.CreateRuntimeWorld()` calls `WorldServiceContainerFactory.CreateWithAttributes()` to scan MOBA assemblies, registers `MobaWorldBootstrapModule` with a `MobaEntitasContextsFactory`, creates an `InProcessHostNetwork`, and brings up a fully functional MOBA world — identical to what Unity would create. This makes the Console Demo a credible CI entry point, not a simplified stub.
+
+</Accordion>
+
+## Actor Spawn and Entity Index
+
+`MobaActorSpawnService` is the single entry point for all actor creation:
+
+```csharp
+public sealed class MobaActorSpawnRequest
+{
+    public MobaActorBuildSpec Spec;
+    public bool AllocateActorIdIfMissing;
+    public bool RegisterActor = true;
+    public bool RegisterEntityManager = true;
+    public Action<ActorEntity, MobaActorBuildSpec> Initializer;
+    public Action<ActorEntity, MobaActorBuildSpec> OnActorBuilt;
+}
+```
+
+`MobaEntityManager` maintains direct `actorId → ActorEntity` lookup plus multi-key indices:
+
+```csharp
+public readonly BattleEntityManager<int> Index;
+public readonly KeyedEntityIndex<Team, int> ByTeam;
+public readonly KeyedEntityIndex<EntityMainType, int> ByMainType;
+public readonly KeyedEntityIndex<UnitSubType, int> ByUnitSubType;
+public readonly KeyedEntityIndex<PlayerId, int> ByOwnerPlayer;
+```
+
+Actor ID is the stable cross-layer identity key used by skill targeting, buff queries, projectile hit filtering, snapshot emission, and presentation layer actor mapping.
+
+## MOBA Console as the Key Assembly Entry
+
+For pure-C# validation (no Unity), the Console Demo is the canonical entry point. Run it with:
+
+```bash
+dotnet run --project src/AbilityKit.Demo.Moba.Console/AbilityKit.Demo.Moba.Console.csproj
+```
+
+`MobaCompleteBattleLifecycleSmokeTests` and skill/summon/AI/rollback tests all construct `ConsoleBattleBootstrapper` directly, proving it is a legitimate test harness rather than a read-only example. See the [Console Demo page](/examples/console-demo) for the full bootstrapper walkthrough.

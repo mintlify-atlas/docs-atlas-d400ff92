@@ -1,0 +1,175 @@
+---
+title: "Frame Sync: Input Pipeline and Orleans Relay in AbilityKit"
+sidebarTitle: "Frame Sync"
+description: "AbilityKit frame sync: FrameIndex, PlayerInputCommand, FramePacket, RemoteFrameAggregator, BattleFrameSyncGrain, and project determinism requirements."
+---
+
+Frame synchronization in AbilityKit is built around a single principle: all participants advance the same deterministic simulation by consuming the same player inputs at the same frame numbers. The framework does not transmit full world state every frame — it transmits `PlayerInputCommand` values, confirms them via the Orleans `BattleFrameSyncGrain`, and lets each simulation instance reconstruct identical outcomes. The MOBA demo uses this as its primary network mode under the `frame-sync-authority` template.
+
+## Relevant Packages
+
+- **`com.abilitykit.world.framesync`** — `FrameIndex`, `PlayerInputCommand`, `IWorldInputSink`, `IRollbackStateProvider`, `RollbackCoordinator`
+- **`com.abilitykit.world.networkfragments`** — `FramePacket`, `RemoteFrameAggregator`, `RemoteInputFrame`, `RemoteSnapshotFrame`
+
+## Core Types
+
+### `FrameIndex`
+
+`FrameIndex` is a lightweight readonly struct that identifies a logical simulation frame. All frame-tagged objects (`PlayerInputCommand`, `FramePacket`, rollback snapshots) use `FrameIndex` as their frame coordinate.
+
+```csharp
+public readonly struct FrameIndex
+{
+    public readonly int Value;
+
+    public FrameIndex(int value)
+    {
+        Value = value;
+    }
+
+    public override string ToString() => Value.ToString();
+}
+```
+
+### `PlayerInputCommand`
+
+`PlayerInputCommand` is the central input value object. It records which frame an input belongs to, which player issued it, and what that input means — encoded as an `OpCode` and a binary `Payload`. The framework deliberately does not define a fixed `EInputType` enum. `OpCode` values are project-defined, which means the same frame sync infrastructure works for MOBA skill casts, Shooter aim-and-fire inputs, and any other game genre without modification.
+
+```csharp
+public readonly struct PlayerInputCommand
+{
+    public readonly FrameIndex Frame;
+    public readonly PlayerId Player;
+    public readonly int OpCode;
+    public readonly byte[] Payload;
+
+    public PlayerInputCommand(FrameIndex frame, PlayerId player, int opCode, byte[] payload)
+    {
+        Frame = frame;
+        Player = player;
+        OpCode = opCode;
+        Payload = payload;
+    }
+}
+```
+
+<ParamField path="Frame" type="FrameIndex" required>
+  The logical simulation frame this input belongs to. The server's `BattleInputFrameScheduler` may remap or reject inputs that arrive too early or too late relative to the current authoritative frame.
+</ParamField>
+
+<ParamField path="Player" type="PlayerId" required>
+  The identity of the player who issued this command. Used by the simulation to route input to the correct actor.
+</ParamField>
+
+<ParamField path="OpCode" type="int" required>
+  A project-defined integer discriminator. The framework never interprets this value — only the project's codec layer does. Use `OpCode` to distinguish between move, cast, stop, interact, or any other input category.
+</ParamField>
+
+<ParamField path="Payload" type="byte[]" required>
+  The serialized data for this input. May be empty for zero-parameter inputs (e.g., a stop command). Projects encode and decode this field using their own codec (e.g., MemoryPack).
+</ParamField>
+
+<Warning>
+Determinism is **not** automatic. `PlayerInputCommand` delivers the same bytes to every simulation endpoint, but the simulation's output is only identical if the code that consumes those bytes is deterministic. Projects must audit all floating-point arithmetic (use fixed-point math where possible), ensure container iteration order is stable across platforms, and constrain random number generation to a seeded, reproducible source. The framework cannot enforce determinism on your behalf.
+</Warning>
+
+## `FramePacket`: The Unified Frame Envelope
+
+`FramePacket` is the network-layer carrier that combines player inputs and an optional `WorldStateSnapshot` for a single world and frame. It also implements `ISnapshotEnvelope`, so the snapshot routing layer can consume it without depending on any network-specific type.
+
+```csharp
+public sealed class FramePacket : ISnapshotEnvelope
+{
+    public FramePacket(WorldId worldId, FrameIndex frame,
+        IReadOnlyList<PlayerInputCommand> inputs, WorldStateSnapshot? snapshot)
+    {
+        WorldId = worldId;
+        Frame = frame;
+        Inputs = inputs ?? Array.Empty<PlayerInputCommand>();
+        Snapshot = snapshot;
+    }
+
+    public WorldId WorldId { get; }
+    public FrameIndex Frame { get; }
+    public IReadOnlyList<PlayerInputCommand> Inputs { get; }
+    public WorldStateSnapshot? Snapshot { get; }
+}
+```
+
+Because `FramePacket` implements `ISnapshotEnvelope`, the same object can be broadcast as a frame sync message, fed into `FrameSnapshotDispatcher` for snapshot routing, and stored by the record system for replay — without any conversion.
+
+## `RemoteFrameAggregator`: Ordering Out-of-Order Arrivals
+
+In real network conditions, `FramePacket` objects arrive out of order, in batches, or with duplicates. `RemoteFrameAggregator` normalizes this into per-frame input and snapshot collections that can be consumed in logical frame order.
+
+`AddPacket` performs three steps:
+1. Drops packets with null inputs and negative frame numbers.
+2. Appends inputs to `_inputsByFrame[frame]` when the packet contains inputs.
+3. Appends the packet as an `ISnapshotEnvelope` to `_envelopesByFrame[frame]` when the packet contains a snapshot.
+
+After packets accumulate, consumers read them frame by frame:
+
+```csharp
+RemoteInputFrame inputFrame = aggregator.BuildInputFrame(new FrameIndex(42));
+RemoteSnapshotFrame snapshotFrame = aggregator.BuildSnapshotFrame(new FrameIndex(42));
+```
+
+Call `aggregator.TrimBefore(minFrameInclusive)` periodically to release memory for confirmed frames. In long-running sessions, failing to trim causes unbounded dictionary growth.
+
+## The Frame Sync Driver Pipeline (Host Side)
+
+On the hosting side, `FrameSyncDriverModule` drives the frame sync lifecycle by hooking into `HostRuntimeOptions.PreTick` and `PostTick`:
+
+**PreTick** — Increments `_frame` to `nextFrame`, copies each world's `PendingInputs` to an array, clears the pending list, fires the `InputsFlushed` event, and calls `IWorldInputSink.Submit(nextFrame, inputs)`. Even empty input arrays are submitted so that every participant advances the same frame count. The world never sees partial or mid-frame inputs.
+
+**PostTick** — Resolves `IWorldStateSnapshotProvider` from the world's service container, optionally captures a snapshot, and broadcasts `FrameMessage(new FramePacket(worldId, frame, inputs, snapshot))`. The snapshot is optional — frame sync does not require a snapshot every frame.
+
+`FrameSyncDriverModule` registers two features on the `HostRuntime` so other modules can observe inputs without depending on the concrete driver:
+
+```csharp
+runtime.Features.RegisterFeature<IFrameSyncInputHub>(this);
+runtime.Features.RegisterFeature<IFrameSyncDriverEvents>(this);
+```
+
+`IFrameSyncDriverEvents` lets modules like `ServerFrameTimeModule`, `ServerRollbackModule`, and the record system subscribe to input flush and post-step events without creating coupling to the driver.
+
+## Client-Side: `FramePacketNetAdapter`
+
+When a client receives a `FramePacket` from the network, `FramePacketNetAdapter.ProcessAndFeed` writes the inputs into two separate buffers and routes the optional snapshot:
+
+| Buffer | Delay | Purpose |
+|---|---|---|
+| `RemoteDrivenSink` | `InputDelayFrames` | Jitter-buffered remote input for smooth prediction |
+| `ConfirmedSink` | 0 delay | Zero-lag confirmed input for rollback reconciliation |
+
+The adapter lazily creates each `FrameJitterBuffer<PlayerInputCommand[]>` on first use. After writing inputs, it calls `Snapshots.Feed(packet)` to forward the envelope to `FrameSnapshotDispatcher`.
+
+## Orleans Relay: `BattleFrameSyncGrain`
+
+In a multiplayer session, `BattleFrameSyncGrain` acts as the authoritative frame relay. It stores inputs by frame number and pushes `FramePushedEvent` to all subscribers at the configured tick rate. The grain contract is minimal:
+
+```csharp
+public interface IBattleFrameSyncGrain : IGrainWithStringKey
+{
+    Task InitializeAsync(FrameSyncStartOptions options);
+    Task SubscribeAsync(IFrameSyncObserver observer);
+    Task UnsubscribeAsync(IFrameSyncObserver observer);
+    Task SubmitInputAsync(ulong worldId, int frame, FrameInputItem input);
+}
+```
+
+The grain is initialized by `RoomGrain.StartBattleAsync` only when the gameplay template declares frame sync support. The MOBA module always registers `frame-sync-authority`, so it always initializes both the `BattleFrameSyncGrain` and the authoritative `BattleLogicHostGrain`. The Shooter module registers `state-sync-authority` and does not create a `BattleFrameSyncGrain`.
+
+## What Projects Must Provide
+
+Frame sync gives you the transport, buffering, and relay machinery. Projects are responsible for:
+
+- **Input ordering**: Deciding which player input belongs to which frame, and handling the server's `BattleInputFrameScheduler` response (accepted, remapped, or rejected).
+- **Authoritative submission**: Routing accepted inputs from `IFrameSyncInputHub.SubmitInput` to the correct world session.
+- **Determinism**: Auditing all code paths that run inside `IWorldInputSink` and downstream gameplay systems. Fixed-point math, stable container iteration, and seeded RNG are not provided by the framework.
+- **Catch-up strategy**: Deciding how late-joining or reconnecting clients consume missed frames. `FrameSyncCatchUpClientModule` provides primitives but is not yet wired into the reconnect main path.
+- **Disconnect recovery**: Determining when to request a full baseline snapshot versus attempting to replay from a cached rollback state.
+
+<Tip>
+The MOBA Console demo (`src/AbilityKit.Demo.Moba.Console`) is the best reference implementation for frame sync as a primary mode. It shows how `FramePacket`, `RemoteFrameAggregator`, `FramePacketNetAdapter`, and `ConsoleRecordWriter` assemble into a working multiplayer battle loop without any Unity dependency.
+</Tip>

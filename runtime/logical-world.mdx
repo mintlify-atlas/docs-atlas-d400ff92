@@ -1,0 +1,179 @@
+---
+title: "Logical World: Host, WorldManager & Runtime Lifecycle"
+sidebarTitle: "Logical World"
+description: "How AbilityKit's IWorld, WorldManager, and Host packages create, tick, and destroy runtime worlds, and how modules extend the Host with hooks and features."
+---
+
+AbilityKit uses the word "world" in two distinct but complementary senses. The first meaning is a **logical runtime world** — an object with an identity, a service resolver, an initialize method, a tick, and a dispose. The second meaning is a **state-storage world** — the ECS backend (EntityWorld, Entitas Contexts, or Svelto EnginesRoot) that holds entity data. This page focuses on the first meaning: how `IWorld`, `WorldManager`, and the Host packages assemble, drive, and tear down a battle or simulation instance.
+
+<Info>
+  Three packages own this domain: `com.abilitykit.host` manages world lifecycle, client connections, and message broadcast; `com.abilitykit.host.extension` provides FramePacketNetAdapter, Session, Hook, Feature, and Blueprint utilities; and `com.abilitykit.coordinator` is a **contract-only package** — it defines `SessionConfig` and host/policy interfaces but contains no `SessionCoordinator` class or unified sync adapter.
+</Info>
+
+## Two Meanings of "World"
+
+The design keeps the two world concepts strictly separate so that the Host can be shared across Console, Unity, and server runtimes without knowing which ECS backend a project has chosen.
+
+| Concept | Source entry | Responsibility |
+|---|---|---|
+| `IWorld` | `com.abilitykit.world.di` | Identity (`WorldId`, `WorldType`), `IWorldResolver Services`, `Initialize()`, `Tick(float)`, `Dispose()` |
+| `WorldManager` | `com.abilitykit.world.di` | Create, look up, tick all worlds, destroy, and dispose all |
+| `IWorldResolver` | `com.abilitykit.world.di` | Resolve services from the world's DI container or scope |
+| `IWorldModule` | `com.abilitykit.world.di` | Assembly pattern for registering services and installing Entitas systems |
+| `EntityWorld` | `com.abilitykit.world.ecs` | Built-in ECS state storage — entities, components, queries, events |
+| `HostRuntime` | `com.abilitykit.host` | Wraps WorldManager with lifecycle Hooks, connection management, and broadcast |
+
+The minimal `IWorld` interface is intentionally small:
+
+```csharp
+public interface IWorld : IDisposable
+{
+    WorldId Id { get; }
+    string WorldType { get; }
+    IWorldResolver Services { get; }
+
+    void Initialize();
+    void Tick(float deltaTime);
+}
+```
+
+The Host never needs to know whether a world uses Entitas, Svelto, or the built-in ECS. It calls `Initialize()`, drives `Tick(deltaTime)` every frame, and calls `Dispose()` when the battle ends.
+
+## WorldManager
+
+`WorldManager` holds a `Dictionary<WorldId, IWorld>` and delegates creation to an `IWorldFactory`. Its core behavior:
+
+- **Create**: validates that `Id` and `WorldType` are non-empty, rejects duplicate IDs, calls the factory, calls `world.Initialize()`, then inserts the world into the dictionary.
+- **Tick**: iterates every world, wraps each `world.Tick(deltaTime)` in a try/catch, and logs per-world failures — so a single broken room never stops other rooms from advancing.
+- **Destroy**: removes the world from the dictionary first, then calls `Dispose()`.
+
+<Warning>
+  `WorldManager` operates on a single thread. Creating or destroying worlds during a Tick loop can cause collection-modification exceptions. Schedule Create/Destroy calls at Tick boundaries.
+</Warning>
+
+## HostRuntime and WorldHostBuilder
+
+`HostRuntime` wraps `WorldManager` and adds four extra capabilities: lifecycle Hooks (`HostRuntimeOptions`), a cross-module capability registry (`HostRuntimeFeatures`), client-connection management (`IServerConnection` dictionary), and `ServerMessage` broadcast.
+
+`WorldHostBuilder.BuildWithOptions()` wires everything together in a deterministic order:
+
+1. Choose or create the `IWorldFactory` (optionally wrapping it with a Blueprint registry).
+2. Create `WorldManager`.
+3. Create `HostRuntimeOptions` and `HostRuntime`.
+4. Attach connection manager, time driver, and input driver.
+5. Register snapshot provider into `runtime.Features`.
+6. Call `module.Install(runtime, options)` for each module in add-order.
+
+## Host Extension Package
+
+`com.abilitykit.host.extension` ships the production-ready modules that projects add to `WorldHostBuilder`:
+
+<CardGroup cols={2}>
+  <Card title="FrameSyncDriverModule" icon="arrows-rotate">
+    Collects per-player input, flushes it to `IWorldInputSink` in PreTick, and broadcasts `FrameMessage` packets in PostTick. Registers `IFrameSyncInputHub` and `IFrameSyncDriverEvents` as Features.
+  </Card>
+  <Card title="ServerFrameTimeModule" icon="clock">
+    Registers `IFrameTime` into each world's `ServiceBuilder` via the `BeforeCreateWorld` Hook. Steps world time in PostTick (or after each `IFrameSyncDriverEvents.PostStep` if the frame-sync module is installed).
+  </Card>
+  <Card title="WorldAutoStartModule" icon="play">
+    Scans world services on each PostTick. When `IWorldAutoStartHandler.TryAutoStart()` returns true for a world, marks it as started. Allows battle-start logic to live in world services rather than the Host.
+  </Card>
+  <Card title="ServerRollbackModule" icon="rotate-left">
+    Subscribes to `IFrameSyncDriverEvents` to capture per-frame input history and snapshot references for server-side rollback.
+  </Card>
+</CardGroup>
+
+## Coordinator Package (Contract Only)
+
+`com.abilitykit.coordinator` defines the **contracts** for session configuration and host/policy boundaries:
+
+<Note>
+  `com.abilitykit.coordinator` contains `SessionConfig`, host interface contracts, and policy interfaces, but does **not** contain a `SessionCoordinator` class, a unified sync adapter, or a drive gate implementation. Projects build their own coordinator on top of these contracts.
+</Note>
+
+## Building a World: ConsoleBattleBootstrapper Pattern
+
+The MOBA Console Demo's `ConsoleBattleBootstrapper` illustrates how all these layers connect. Conceptually the flow is:
+
+```
+BattleStartConfig
+  └── IWorldModule list (MobaWorldBootstrapModule, ...)
+        └── WorldManager.Create(WorldCreateOptions)
+              └── IWorldFactory → IWorld
+                    └── IWorld.Initialize()
+                          └── WorldContainer.Build() → WorldScope
+                                └── IWorldResolver (resolves services + ECS contexts)
+```
+
+<Steps>
+  <Step title="Register Modules">
+    Build a `WorldCreateOptions` containing the `IWorldModule` list, a `ServiceBuilder` callback, and the world's `WorldType` string. Each module's `Configure(builder)` method registers its services into the DI container.
+  </Step>
+  <Step title="ConfigureWorld">
+    The `IWorldFactory` creates the concrete `IWorld` implementation (e.g., `EntitasWorld`), which runs `EntitasWorldComposer.Compose()` — dependency-sorting modules, building the `WorldContainer`, and installing Entitas systems.
+  </Step>
+  <Step title="Start BattleFlow">
+    `BattleFlow.Start()` drives a `PhaseHost` through Prepare → Connect → Create → Load → InMatch phases. The `HostRuntime` begins calling `Tick(deltaTime)` every logical frame, propagating down through `WorldManager` to `IWorld.Tick()`.
+  </Step>
+  <Step title="InMatchPhase → FeatureHost Tick">
+    Inside the InMatch phase, a `FeatureHost` attaches features (entity management, input, sync, view). Each feature ticks, submitting inputs to `IWorldInputSink` and reading `ActorStateSnapshot` output for the view layer.
+  </Step>
+</Steps>
+
+## Hook and Feature System
+
+Modules extend the Host without modifying `HostRuntime` source code. They subscribe to lifecycle Hooks during `Install` and unsubscribe during `Uninstall`.
+
+| Hook | Triggered | Common uses |
+|---|---|---|
+| `BeforeCreateWorld` | Before `WorldManager.Create` | Inject `IFrameTime` into `WorldCreateOptions.ServiceBuilder` |
+| `WorldCreated` | After `IWorld.Initialize()` | Create per-world module sessions |
+| `WorldDestroyed` | After `WorldManager.Destroy` | Clean up module caches |
+| `PreTick` | Before `WorldManager.Tick` | Flush input buffers |
+| `PostTick` | After `WorldManager.Tick` | Broadcast frame snapshots, step logical time |
+| `BeforeSendMessage` / `AfterSendMessage` | Around `IServerConnection.Send` | Metrics, encoding, diagnostics |
+
+`HostRuntimeFeatures` is a lightweight `Type → object` registry that lets modules discover each other's capabilities without hard dependencies:
+
+```csharp
+// FrameSyncDriverModule registers its capability:
+runtime.Features.RegisterFeature<IFrameSyncInputHub>(this);
+runtime.Features.RegisterFeature<IFrameSyncDriverEvents>(this);
+
+// ServerFrameTimeModule reads it:
+if (runtime.Features.TryGetFeature<IFrameSyncDriverEvents>(out var events))
+    events.AddPostStep(OnPostStep);
+```
+
+<Tip>
+  Install modules in dependency order: `FrameSyncDriverModule` before `ServerFrameTimeModule` and `ServerRollbackModule`, because those modules read the `IFrameSyncDriverEvents` Feature registered by the frame-sync module.
+</Tip>
+
+## WorldClock and Logical Time
+
+`WorldClock` is the canonical logical-time service injected into each world:
+
+```csharp
+public sealed class WorldClock : IWorldClock
+{
+    public float DeltaTime { get; private set; }
+    public float Time { get; private set; }
+
+    public void Tick(float deltaTime)
+    {
+        DeltaTime = deltaTime;
+        Time += deltaTime;
+    }
+}
+```
+
+Logical time is always driven externally — the Host or `ServerFrameTimeModule` passes `deltaTime` in. Systems must never read `System.DateTime` or `UnityEngine.Time` for deterministic simulation.
+
+## Source Reading Path
+
+1. `IWorld.cs` — minimal world contract.
+2. `WorldManager.cs` — multi-world creation, Tick, and destroy.
+3. `WorldCreateOptions.cs` — how modules and service builders are passed to the factory.
+4. `HostRuntime.cs` — CreateWorld / Tick / Broadcast flow with Hook extensions.
+5. `WorldHostBuilder.cs` — canonical assembly order.
+6. `FrameSyncDriverModule.cs` — the most complete real-world module example.

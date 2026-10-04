@@ -1,0 +1,197 @@
+---
+title: "Dependency Injection: World-Scoped Service Container"
+sidebarTitle: "DI Container"
+description: "The com.abilitykit.world.di package provides a lightweight Singleton, Scoped, and Transient DI container purpose-built for per-battle service composition."
+---
+
+AbilityKit's world-level DI container (`com.abilitykit.world.di`) solves a focused problem: assembling the services a single logical world needs during its lifetime. It is not a general-purpose IoC framework. There are no interceptors, conditional bindings, or runtime hot-swapping. What it does provide — constructor injection, member injection, scoped lifetimes, seed objects, and ordered disposal — covers everything required for deterministic combat services without introducing unpredictable resolution paths.
+
+The container is intentionally separate from the ECS layer. Services (business rules, configuration, diagnostic helpers) live in the DI container and are resolved through `IWorldResolver`. Entity state lives in the ECS world and is queried through component indexes. Mixing the two would make neither layer clean.
+
+## Core Concepts
+
+### WorldContainerBuilder and WorldContainer
+
+`WorldContainerBuilder` is the registration surface. Call it during world creation, then call `Build()` to produce an immutable `WorldContainer`:
+
+```csharp
+var builder = new WorldContainerBuilder();
+
+// Project-explicit registration — overwrites any earlier entry:
+builder.Register<ICombatLog>(WorldLifetime.Singleton, r => new CombatLog());
+
+// Framework default — only registers if not yet present:
+builder.TryRegister<IWorldClock>(WorldLifetime.Singleton, r => new WorldClock());
+
+// Type-based registration — constructor and [WorldInject] members are auto-wired:
+builder.RegisterType<IDamageService, DamageService>(WorldLifetime.Scoped);
+
+// Pre-built instance (always Singleton):
+builder.RegisterInstance<IStaticConfig>(config);
+
+// Module-pattern bulk registration:
+builder.AddModule(new BattleWorldModule());
+
+var container = builder.Build();
+```
+
+`Register` overwrites existing entries; `TryRegister` is a no-op if the type is already registered. This lets framework modules supply safe defaults that projects can override.
+
+### IWorldResolver
+
+`IWorldResolver` is the resolution interface exposed to systems and services. Both `WorldContainer` and `WorldScope` implement it:
+
+```csharp
+// Resolve a required service — throws if not found:
+var clock = resolver.Resolve<IWorldClock>();
+
+// Resolve an optional service — returns false without throwing:
+if (resolver.TryResolve<IDiagnosticsService>(out var diag))
+    diag.Record("world_started");
+```
+
+<Warning>
+  `TryResolve` on the root `WorldContainer` swallows factory exceptions and returns `false`. Use `Resolve` during configuration troubleshooting so errors surface immediately rather than appearing as missing services.
+</Warning>
+
+## Service Lifetimes
+
+<ParamField name="Singleton" type="WorldLifetime.Singleton">
+  One instance per `WorldContainer`. Created on first resolution and cached for the container's lifetime. Use for world-wide services that must be shared across all scopes: `IWorldClock`, `IStaticConfig`, entity index services, and diagnostic hubs.
+</ParamField>
+
+<ParamField name="Scoped" type="WorldLifetime.Scoped">
+  One instance per `WorldScope`. A new instance is created the first time the scope resolves the type and cached within that scope. Use for per-battle or per-skill contexts: `IDamageService`, `ISkillRuntime`, `IBattleSessionContext`. Scoped services cannot be resolved from the root container — attempting to do so throws an exception to prevent scope-capture bugs.
+</ParamField>
+
+<ParamField name="Transient" type="WorldLifetime.Transient">
+  A new instance on every resolution. The container calls `OnInit` after creation, but **does not** track transient instances for disposal. Callers own the lifetime. Use sparingly — prefer Scoped when you need isolation with managed cleanup.
+</ParamField>
+
+## Constructor Injection and [WorldInject] Member Injection
+
+When you use `RegisterType<TService, TImpl>()`, the container uses `WorldActivator` to construct the implementation. The activator:
+
+1. Inspects all `public` constructors, sorted by parameter count (most parameters first).
+2. Selects the first constructor where every parameter type can be resolved via `TryResolve`.
+3. After construction, injects fields and properties marked with `[WorldInject]`.
+
+```csharp
+public sealed class DamageService : IDamageService
+{
+    private readonly IWorldClock _clock;          // constructor injection
+
+    [WorldInject] private IMetricsService _metrics;   // optional member injection
+    [WorldInject(required: true)] private IActorIndex _actors; // required member injection
+
+    public DamageService(IWorldClock clock)
+    {
+        _clock = clock;
+    }
+}
+```
+
+`[WorldInject(required: false)]` keeps the field at its default value when the service is not registered. `[WorldInject(required: true)]` (the default) throws if the service cannot be resolved.
+
+## Scoped Containers and Seed Objects
+
+`WorldContainer.CreateScope()` creates a `WorldScope` that inherits singleton resolution from the root container but provides its own scoped instances. The overload accepting a seeder callback lets you inject runtime objects that are owned externally:
+
+```csharp
+using var scope = container.CreateScope(seed =>
+{
+    seed.Seed<BattleContext>(battleContext);   // owned by the battle session
+    seed.Seed<ICommandBuffer>(commandBuffer); // owned by the frame-sync adapter
+});
+
+// Scoped services can now be resolved:
+var damage = scope.Resolve<IDamageService>();
+```
+
+Seeded objects are stored separately from scoped-created objects. When the scope is disposed, seeded instances are **not** disposed by the container — only the scope's own created instances are disposed.
+
+## IWorldInitializable, IWorldDeinitializable, and Disposal Order
+
+Services can hook into the container lifecycle:
+
+```csharp
+public interface IWorldInitializable
+{
+    void OnInit(IWorldResolver services);   // called after construction
+}
+
+public interface IWorldDeinitializable
+{
+    void OnDeinit(IWorldResolver services); // called before Dispose
+}
+```
+
+When a scope or root container is disposed, instances are processed in **reverse creation order**: the most-recently-created instance is deinitialized and disposed first. This mirrors a dependency stack — services that depend on others are torn down before their dependencies.
+
+```
+Scope.Dispose():
+  ↓ reverse over scoped instances
+    OnDeinit(scope)
+    IDisposable.Dispose()
+  ↓ clear scoped and seeded maps
+
+Container.Dispose():
+  ↓ reverse over singleton instances
+    OnDeinit(root)
+    IDisposable.Dispose()
+  ↓ clear singleton map
+```
+
+<Note>
+  Transient instances are initialized (`OnInit` is called) but never enter the disposal list. If a transient holds disposable resources, the caller must dispose it explicitly.
+</Note>
+
+## IWorldModule Installation Pattern
+
+`IWorldModule` (defined in `com.abilitykit.world.di`) is the canonical way to bundle related services together and hand them to the container as a unit:
+
+```csharp
+public sealed class BattleWorldModule : IWorldModule
+{
+    public void Configure(WorldContainerBuilder builder)
+    {
+        builder.TryRegister<IWorldClock>(WorldLifetime.Singleton, _ => new WorldClock());
+        builder.RegisterType<IDamageService, DamageService>(WorldLifetime.Scoped);
+        builder.RegisterType<IActorIndex, ActorIndex>(WorldLifetime.Singleton);
+    }
+}
+```
+
+Modules are added via `builder.AddModule(module)` or via `WorldCreateOptions.Modules`. The `EntitasWorldComposer` applies topological sorting and conflict detection to the module list before calling `Configure` — so circular module dependencies and duplicate registrations produce clear diagnostic messages rather than silent failures.
+
+## Attribute-Based Auto-Registration
+
+`AttributeWorldServicesModule` scans assemblies for classes decorated with `[WorldService]` and registers them via `TryRegister` (framework default, not overriding):
+
+```csharp
+[WorldService(typeof(IDamageService), WorldLifetime.Scoped)]
+public sealed class DamageService : IDamageService { ... }
+```
+
+This is the pattern used by AbilityKit's own framework packages to provide defaults. Projects call `builder.Register<IDamageService>(...)` to override them.
+
+## Why World DI Is Separate from the ECS
+
+| Concern | World DI | ECS Layer |
+|---|---|---|
+| What it holds | Services, configuration, business rules | Entities, components, spatial data |
+| Lifetime | World or scope lifetime | Entity lifetime (can be much shorter) |
+| Resolution pattern | Type-keyed singleton/scoped/transient | Index + type-ID component lookup |
+| Access pattern | `resolver.Resolve<T>()` at init time | `world.Query<T>()` every tick |
+| Threading | Single-thread assembly and resolution | Single-thread simulation tick |
+
+Services do not belong in the ECS component store, and entity component arrays are not service containers. Keeping the two separate makes both layers easier to reason about, test, and replace independently.
+
+## Source Reading Path
+
+1. `WorldContainerBuilder.cs` — registration API.
+2. `WorldActivator.cs` — constructor selection and `[WorldInject]` member injection.
+3. `WorldContainer.cs` — root container resolution and Singleton/Transient lifetime.
+4. `WorldScope.cs` — scoped instance cache, seed dictionary, and disposal.
+5. `AttributeWorldServicesModule.cs` — attribute-scan registration for framework defaults.
+6. `src/AbilityKit.World.DI.Tests/` — 31 passing tests covering registration priority, seeding ownership, member injection, dependency cycles, and reverse-order disposal.

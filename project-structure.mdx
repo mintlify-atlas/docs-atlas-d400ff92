@@ -1,0 +1,294 @@
+---
+title: "Project Structure: Packages, Source, Server, and Docs"
+sidebarTitle: "Project Structure"
+description: "How AbilityKit's directories relate to each other — UPM packages, .NET solution, Orleans server, design docs, and config — and the three compilation modes."
+---
+
+AbilityKit's repository is not organized as a single Unity project or a single .NET solution. It is a collection of Unity UPM packages, .NET SDK projects, server-side code, design documents, and tooling — all sharing the same source files. Understanding the directory layout is a prerequisite for finding source code, knowing where to make changes, and understanding how the build system works.
+
+The single most important structural rule in the repository is: **`Unity/Packages/` is the authoritative source location for all shared package runtime code.** The `.NET` projects in `src/` do not contain their own copies of the framework source — they reference the same files from `Unity/Packages/` via `<Compile Include>` entries in their `.csproj` files. This means a change made in `Unity/Packages/` is immediately reflected in both the Unity build and the `dotnet build` / `dotnet test` pipeline.
+
+## Top-Level Directory Overview
+
+```text
+AbilityKit/
+├── Unity/
+│   ├── Packages/      ← shared package runtime (authoritative source)
+│   └── Assets/        ← Unity host project, scenes, and scene-level assets
+├── src/               ← .NET solution: builds, tests, Console Demo
+├── Server/
+│   └── Orleans/       ← server-side grains, gateway, and smoke runners
+├── Docs/
+│   └── design/        ← canonical design documentation organized by topic
+├── LubanConfig/       ← config generation inputs and templates
+├── tools/             ← local dev, validation, and smoke scripts
+└── .cursor/rules/     ← engineering constraints (source-of-truth rules)
+```
+
+<Accordion title="Unity/Packages — Framework Source and UPM Packages">
+  `Unity/Packages/` is where all shared package runtime code lives. Every `com.abilitykit.*` directory is a Unity UPM package with its own `package.json`, one or more `.asmdef` files, and a standard internal layout.
+
+  **When to enter:** Whenever you need to read or modify any framework implementation. This is the correct place to make changes — not inside `src/`.
+
+  **Internal package layout:** Each package typically follows a three-directory convention:
+
+  | Directory | Purpose | Constraint |
+  |---|---|---|
+  | `Runtime/` | Code that can be consumed by Unity Player, .NET projects, and server builds | Must not depend on Unity Editor APIs |
+  | `Editor/` | Unity Editor tooling, generators, debug windows | Compiled only in the Editor build target |
+  | `Samples/` or `Documentation~/` | Examples and package-level documentation | For learning; not a core dependency |
+
+  **Key packages by capability tier:**
+
+  | Capability Tier | Representative Packages |
+  |---|---|
+  | Foundation | `com.abilitykit.core`, `com.abilitykit.world.di` |
+  | SkillCore | `com.abilitykit.triggering`, `com.abilitykit.pipeline`, `com.abilitykit.attributes` |
+  | BattleRuntime | `com.abilitykit.combat.targeting`, `com.abilitykit.combat.projectile`, `com.abilitykit.combat.damage` |
+  | SyncRuntime | `com.abilitykit.world.framesync`, `com.abilitykit.world.snapshot`, `com.abilitykit.world.statesync`, `com.abilitykit.record` |
+  | ServerRuntime | `com.abilitykit.host`, `com.abilitykit.host.extension`, protocol packages |
+  | Demo/Reference | `com.abilitykit.demo.moba.*`, `com.abilitykit.demo.shooter.*`, `com.abilitykit.samples` |
+
+  <Note>
+    The sample catalog (`com.abilitykit.samples`) lives in `Unity/Packages/com.abilitykit.samples/` and is the authoritative source for all 37 built-in samples. The .NET projects `src/AbilityKit.Samples.Abstractions` and `src/AbilityKit.Samples.Logic` are projection projects that reference this source via `<Compile Include>`.
+  </Note>
+</Accordion>
+
+<Accordion title="src — .NET Solution, Tests, and Console Demo">
+  `src/` contains the .NET SDK solution (`AbilityKit.sln`) along with all projects for compilation, testing, and the Console Demo. It does not contain its own copies of the framework source — it links to `Unity/Packages/` via `<Compile Include>`.
+
+  **When to enter:** When building the solution, running tests, or debugging the Console Demo. Do not copy framework source files into `src/`.
+
+  **Three compilation modes exist in `src/` projects:**
+
+  | Mode | Description | Example Projects |
+  |---|---|---|
+  | **Pure reference** | Directly references `Unity/Packages/` source with no local overrides | `AbilityKit.Core`, `AbilityKit.Host` |
+  | **Local override** | References package source but excludes specific files and provides .NET-specific replacements | `AbilityKit.World.ECS` (overrides `Impl/EntityWorld.cs`) |
+  | **Aggregate entry** | Contains no source of its own; exists only to aggregate project references as dependencies | `AbilityKit.Demo.Moba.Infrastructure` |
+
+  A typical `.csproj` reference looks like:
+
+  ```xml
+  <ItemGroup>
+    <Compile Include="../../Unity/Packages/com.abilitykit.core/Runtime/**/*.cs" />
+    <Compile Include="../../Unity/Packages/com.abilitykit.world.di/Runtime/**/*.cs" />
+  </ItemGroup>
+  ```
+
+  **Key `src/` projects and their purposes:**
+
+  | Project | Purpose |
+  |---|---|
+  | `AbilityKit.Demo.Moba.Console/` | Full runnable MOBA combat loop — config, World, input, sync, snapshot, view, auto-test, replay |
+  | `AbilityKit.World.DI.Tests/` | Most direct test of service lifecycle and scoped DI |
+  | `AbilityKit.Network.Runtime.Tests/` | Clock, latency compensation, sync health events |
+  | `AbilityKit.Demo.Shooter.Runtime.Tests/` | Svelto ECS, state sync, state hash verification |
+  | `AbilityKit.Game.View.Runtime.Tests/` | Presentation session, view pipeline, binding validation |
+  | `AbilityKit.Samples/` | Sample catalog host — `--list`, `--id`, `--all`, `--web` |
+
+  **`src/` directory tree (capability groupings):**
+
+  ```text
+  src/
+  ├── AbilityKit.Core/                          # Math, log, events, GameplayTag, numeric
+  ├── AbilityKit.GameplayTags/                  # Tag system
+  ├── AbilityKit.Modifiers/                     # Attribute modifiers
+  ├── AbilityKit.Diagnostics/                   # Diagnostic tooling
+  │
+  ├── AbilityKit.World.DI/                      # DI container
+  ├── AbilityKit.World.ECS/                     # ECS framework (includes EntityWorld.cs)
+  ├── AbilityKit.World.Entitas/                 # Entitas ECS adapter
+  ├── AbilityKit.World.FrameSync/               # Frame sync runtime
+  ├── AbilityKit.World.NetworkFragments/        # Frame packet layer
+  ├── AbilityKit.World.Snapshot/                # Snapshot routing
+  ├── AbilityKit.World.StateSync/               # State sync and prediction
+  │
+  ├── AbilityKit.Pipeline/                      # Skill pipeline orchestration
+  ├── AbilityKit.Triggering/                    # Event trigger engine
+  ├── AbilityKit.Ability/                       # Skill system aggregate entry
+  │
+  ├── AbilityKit.Flow/                          # Flow engine
+  ├── AbilityKit.HFSM.Core/                     # Hierarchical state machine
+  ├── AbilityKit.ActionSchema/                  # Timeline DTO + TimelinePlayer
+  │
+  ├── AbilityKit.Host/                          # Server-side abstractions
+  ├── AbilityKit.Record/                        # Record/replay system
+  │
+  ├── AbilityKit.Network.Runtime/               # Network runtime
+  ├── AbilityKit.Protocol/                      # Protocol definitions
+  │
+  ├── AbilityKit.Combat.Targeting/              # Target search
+  ├── AbilityKit.Combat.Motion/                 # Motion pipeline
+  ├── AbilityKit.Combat.Projectile/             # Projectile lifecycle
+  ├── AbilityKit.Combat.Damage/                 # Damage pipeline
+  ├── AbilityKit.Combat.Navigation/             # Navigation grid + deterministic A*
+  │
+  ├── AbilityKit.Samples/                       # Sample catalog host
+  ├── AbilityKit.Demo.Moba.Console/             # MOBA Console Demo (executable)
+  ├── AbilityKit.Demo.Shooter.*/                # Shooter logic, host, console, tests
+  └── AbilityKit.Analyzer/                      # Roslyn analyzer
+  ```
+
+  <Note>
+    This tree shows capability groupings, not the complete project list. The actual solution also includes protocol packages, transport adapters, AI, editor tools, smoke runners, benchmark projects, and many focused test projects. Check the relevant `.csproj`, `package.json`, `asmdef`, and design documentation for authoritative dependency information.
+  </Note>
+</Accordion>
+
+<Accordion title="Server/Orleans — Server-Side Grains and Smoke Runners">
+  `Server/Orleans/` contains the server-side application code for the authoritative-server model. This is where Orleans Grain implementations, a Gateway, and remote smoke test runners live.
+
+  **When to enter:** When studying multiplayer server authority, Room lifecycle, remote battle hosting, or multi-process verification.
+
+  **Key projects:**
+
+  | Project | Purpose |
+  |---|---|
+  | `AbilityKit.Orleans.Contracts` | Gateway, Room, Battle, FrameSync server contracts and protocol DTOs |
+  | `AbilityKit.Orleans.Gateway` | HTTP/TCP gateway and client request handling entry point |
+  | `AbilityKit.Orleans.Grains` | `RoomGrain`, `BattleFrameSyncGrain`, `BattleLogicHostGrain`, and related Orleans Grains |
+  | `AbilityKit.Orleans.Host` / `Hosting` | Server host and startup assembly |
+  | `AbilityKit.Orleans.ShooterSmoke` | Shooter remote end-to-end smoke runner |
+
+  The Orleans layer depends on `Host`, `FrameSync`, and `Snapshot` concepts. Read `Docs/design/07-NetworkSynchronization/` before entering the Orleans source to build the required mental model.
+
+  <Warning>
+    The presence of Orleans source code or a workflow entry point in this directory does not mean the server build is currently passing all smoke tests. Treat `src/AbilityKit.Demo.Shooter.Runtime.Tests/` as the most reliable server-adjacent verification point until a full Orleans smoke run is confirmed.
+  </Warning>
+</Accordion>
+
+<Accordion title="Docs/design — Canonical Design Documentation">
+  `Docs/design/` contains the canonical design documentation for AbilityKit, organized by topic area. These documents record capability boundaries, source entry points, lifecycle rules, known limitations, and evidence levels (E0–E5) for each claim.
+
+  **When to enter:** When you need to understand design intent, review lifecycle contracts, or find source code entry points for a specific capability domain.
+
+  **Organization by topic:**
+
+  | Documentation Domain | Primary Source Domain |
+  |---|---|
+  | `01-OverviewAndGettingStarted` | Repository structure, source reading paths, capability map |
+  | `02-LogicalWorldDesign` | `world.di`, `world.ecs`, World abstractions |
+  | `03-LogicalWorldHostDesign` | `host`, `host.extension` |
+  | `04-PresentationLayerDesign` | `world.snapshot`, Demo View Runtime |
+  | `05-CommonModules` | `core`, `timer`, config system |
+  | `06-ECSArchitecture` | `world.ecs`, `world.entitas`, `world.svelto` |
+  | `07-NetworkSynchronization` | `world.framesync`, `world.networkfragments`, `world.snapshot`, `world.statesync`, `record`, `network.runtime` |
+  | `08-GameplayModules` | `triggering`, `ability`, `combat.*`, `attributes`, `pipeline` |
+  | `09-ImplementationExamples` | `demo.moba.*`, `demo.shooter.*`, `Demo.ET.*`, `Server/Orleans` |
+  | `10-EngineeringQuality` | Tests, Smoke, DemoHarness, Acceptance, CI verification flow |
+
+  The master index is at `Docs/design/00-index.md`. Start there to find the entry point for any specific topic.
+</Accordion>
+
+<Accordion title="LubanConfig — Configuration Tables and Generation">
+  `LubanConfig/` contains the input files for Luban-driven configuration generation and configuration-related generation assets used by the MOBA demo.
+
+  **When to enter:** When studying the data-driven pipeline — how raw config tables are transformed into typed runtime DTOs, how `TriggerPlan` JSON is authored, or how the MOBA config schema is maintained.
+
+  The MOBA demo has its own Source Generator (`com.abilitykit.demo.moba.codegen`) that reads declarations from the project and generates MOBA-specific manifests. `ActionTimeline` DTOs live in `com.abilitykit.actionschema` and are a separate protocol from the Triggering Action Schema — do not conflate the two.
+</Accordion>
+
+<Accordion title="tools — Local Dev, Validation, and Smoke Scripts">
+  `tools/` contains scripts for local development workflows, sample baseline validation, smoke test runners, and export utilities.
+
+  **When to enter:** When running checks, exporting sample pages, or debugging CI gate failures.
+
+  | Script | Purpose |
+  |---|---|
+  | `tools/check_sample_baseline.ps1` | Validate all 37 sample outputs against the golden baseline; use `-Update` to refresh the baseline after an intentional change |
+  | `tools/samples/sample-baseline.txt` | The golden baseline file — 37 sample outputs and manifest validation results |
+  | `tools/publish/audit-versions.js` | Validate that framework package versions, internal references, and `package.json` format all meet the release requirements |
+</Accordion>
+
+## How Source Flows Between Directories
+
+The diagram below shows the flow of source code between the repository's major directories. The key insight is that `Unity/Packages/` feeds both the Unity build pipeline and the .NET SDK build pipeline without duplication.
+
+```text
+Unity/Packages/              ← single authoritative source location
+       │
+       ├──────────────────► Unity Editor / Player (asmdef compilation)
+       │
+       └──────────────────► src/*.csproj (via <Compile Include>)
+                                   │
+                                   ├──► dotnet build / dotnet test
+                                   ├──► Console Demo executable
+                                   └──► Server/Orleans (server-side builds)
+```
+
+<Warning>
+  If you copy source files from `Unity/Packages/` into `src/`, the Unity and .NET builds will diverge. Tests may pass while Unity behavior differs, or vice versa. Always modify the source in `Unity/Packages/` and let the `.csproj` reference pick up the change automatically.
+</Warning>
+
+## Three Compilation Modes
+
+The `.csproj` files in `src/` use three patterns for referencing `Unity/Packages/` source.
+
+**Pure Reference** — the most common mode. The `.csproj` includes all source files from the corresponding package directory. No files are overridden.
+
+```xml
+<!-- AbilityKit.Core.csproj -->
+<ItemGroup>
+  <Compile Include="../../Unity/Packages/com.abilitykit.core/Runtime/**/*.cs" />
+</ItemGroup>
+```
+
+**Local Override** — used when a package contains Unity-specific code that cannot compile with the standard .NET SDK. The project excludes certain files and provides alternative implementations.
+
+```xml
+<!-- AbilityKit.World.ECS.csproj — excludes a Unity-specific file and provides a .NET alternative -->
+<ItemGroup>
+  <Compile Include="../../Unity/Packages/com.abilitykit.world.ecs/Runtime/**/*.cs"
+           Exclude="../../Unity/Packages/com.abilitykit.world.ecs/Runtime/Impl/EntityWorld.cs" />
+  <Compile Include="Impl/EntityWorld.cs" />  <!-- .NET-specific implementation -->
+</ItemGroup>
+```
+
+**Aggregate Entry** — a project that contains no source of its own. It only declares `<ProjectReference>` entries to pull in related projects as a single dependency grouping.
+
+```xml
+<!-- AbilityKit.Demo.Moba.Infrastructure.csproj — no Compile entries, only project references -->
+<ItemGroup>
+  <ProjectReference Include="..\AbilityKit.Demo.Moba.Core\AbilityKit.Demo.Moba.Core.csproj" />
+  <ProjectReference Include="..\AbilityKit.World.DI\AbilityKit.World.DI.csproj" />
+  <!-- ... -->
+</ItemGroup>
+```
+
+## Recommended Change Workflow
+
+When making any code change to the framework, follow this sequence to keep the Unity and .NET builds consistent.
+
+<Steps>
+  <Step title="Find the capability domain in Docs/design">
+    Use `Docs/design/00-index.md` to locate the canonical design document for the capability you are changing. The document will identify the relevant source entry points in `Unity/Packages/`.
+  </Step>
+  <Step title="Make the change in Unity/Packages">
+    Edit the source file inside `Unity/Packages/com.abilitykit.*/Runtime/`. Never edit a file that was generated by referencing another file in `src/`.
+  </Step>
+  <Step title="Run dotnet build and tests">
+    ```powershell
+    dotnet build src/AbilityKit.sln
+    dotnet test src/<RelevantTests>.csproj
+    ```
+  </Step>
+  <Step title="Run the sample baseline check if samples are affected">
+    ```powershell
+    powershell -File tools/check_sample_baseline.ps1
+    ```
+  </Step>
+  <Step title="Update design documentation if behavior changes">
+    If you changed a capability boundary, lifecycle contract, protocol, sync flow, or demo verification path, update the corresponding document in `Docs/design/`. Outdated documentation pointing at incorrect source paths is a persistent cost for the next person reading the code.
+  </Step>
+</Steps>
+
+## Common Directory Mistakes
+
+| Incorrect Assumption | Correct Boundary |
+|---|---|
+| Add new framework source inside `src/` | New framework source belongs in `Unity/Packages/com.abilitykit.*`; let the `.csproj` reference it |
+| Treat demo packages as required project dependencies | Demo packages are reference implementations; adopt packages by capability tier (`Foundation → SkillCore → BattleRuntime → SyncRuntime`) |
+| Depend on `demo.*` packages long-term for application logic | Distinguish package dependency, reference implementation, and intentional copy; project strategy should be explicitly owned by the project |
+| Only read Unity source, skip .NET tests | Core logic should be verified first with `dotnet test` — it is faster and gives clearer failure messages |
+| Start learning from Orleans | Read `Host`, `FrameSync`, and `Snapshot` first; only enter `Server/Orleans` after those concepts are clear |
+| Embed presentation logic inside the logical layer | Use `ViewEventSink`, `Snapshot`, or `PresentationCue` to output to the presentation layer; never let Unity effects, console output, or server logic pollute the simulation core |

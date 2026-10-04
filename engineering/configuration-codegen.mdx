@@ -1,0 +1,279 @@
+---
+title: "Configuration Pipeline and Code Generation in AbilityKit"
+sidebarTitle: "Config & Codegen"
+description: "How Excel and JSON author data flows through Luban into generated C# types, runtime config loading, protocol catalog compilation, and Action schemas."
+---
+
+AbilityKit separates the concern of *how configuration is loaded and built* from *what a game configures*. The framework provides a generic `ConfigDatabase` abstraction that handles loading, deserialisation, table construction, and hot-reload signalling. Projects then build on top of it with their own table registries, generated manifests, and validation rules. The MOBA demo ships the most complete reference implementation of this pattern, including a full Luban pipeline, Roslyn code-generation package, and a runtime integrity validator. Understanding this layered model is the key to connecting authoring tools, generated code, and live gameplay modules.
+
+## The Luban Configuration Pipeline
+
+Luban is the primary offline authoring tool. Designers edit Excel spreadsheets or JSON files; the `export_moba_configs.ps1` script calls the Luban CLI and produces two output streams: staged JSON candidate files for review, and generated C# table classes. Only after a human review does the authoritative JSON land in the package Resources folder, from which it is published to the Console replica by `sync_moba_json_configs.ps1`.
+
+```text
+Excel / JSON authoring input
+        │
+        ▼
+ export_moba_configs.ps1  ──── Luban CLI ────▶  .generated/json/   (review candidates)
+                                           └──▶  .generated/code/   (staged C# classes)
+                                                        │
+                                                        ▼
+                                          Runtime LubanGen (copied to package)
+                                                        │
+                                                        ▼
+                                    Package Resources/moba + ability  (authority)
+                                                        │
+                             ┌──────────────────────────┘
+                             │
+                             ▼
+                  sync_moba_json_configs.ps1
+                             │
+                             ▼
+                  Console/Configs replica  (consumed by .NET tests, ET, training)
+```
+
+The generation command passes the `MiniTemplate/luban.conf` file and targets `all` with `json` and `cs-newtonsoft-json` backends:
+
+```powershell
+# Generate JSON candidates and staged C# — run from LubanConfig/Moba/
+powershell -ExecutionPolicy Bypass -File export_moba_configs.ps1
+
+# Publish the authoritative package JSON to the Console replica
+# (-Check: audit only; -DryRun: preview; -Apply: write)
+powershell -ExecutionPolicy Bypass -File tools/sync_moba_json_configs.ps1 -Apply
+```
+
+<Tip>
+Start with the Moba config as a reference for how table schemas, code generation, and runtime loading connect. The `LubanConfig/Moba/` directory shows the full authoring-to-runtime path: Excel definitions in `Production/Defines/`, data rows in `Production/Datas/`, generated output in `.generated/`, and the live C# classes under `Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Infrastructure/Config/BattleDemo/LubanBinaryGen/`.
+</Tip>
+
+## LubanConfig Directory Structure
+
+The `LubanConfig/Moba/` directory holds everything needed to regenerate MOBA configuration from scratch.
+
+```text
+LubanConfig/Moba/
+├── MiniTemplate/               ← Luban conf + Datas + Defines used for generation
+│   ├── luban.conf
+│   ├── Datas/
+│   └── Defines/
+├── Production/                 ← Full production schema and data
+│   ├── Datas/
+│   └── Defines/
+├── .generated/
+│   ├── json/                   ← Candidate JSON (review before promoting)
+│   ├── code/                   ← Generated C# classes (cs-newtonsoft-json backend)
+│   ├── bytes/                  ← Binary output (Luban bytes backend)
+│   └── code_json/              ← Alternative JSON-backed generated code
+├── export_moba_configs.ps1
+├── convert_to_source_format.ps1
+└── split_trigger_configs.ps1
+```
+
+## Generated Types
+
+Luban produces one C# class per table. Each class contains a constructor that deserialises from a `JToken` and typed properties for every column. These classes live in the `cfg` namespace and are consumed by `LubanConfigGroupDeserializer` to map Luban field names to the framework's DTO field names.
+
+```csharp
+// LubanConfig/Moba/.generated/code/DRBuff.cs  (auto-generated — do not edit)
+namespace cfg
+{
+    public sealed partial class DRBuff : Luban.BeanBase
+    {
+        public DRBuff(JToken _buf)
+        {
+            JObject _obj = _buf as JObject;
+            Id               = (int)_obj.GetValue("Id");
+            Name             = (string)_obj.GetValue("Name");
+            DurationMs       = (int)_obj.GetValue("DurationMs");
+            OngoingEffectId  = (int)_obj.GetValue("OngoingEffectId");
+            StackingPolicy   = (int)_obj.GetValue("StackingPolicy");
+            MaxStacks        = (int)_obj.GetValue("MaxStacks");
+            // ... additional fields
+        }
+
+        public readonly int    Id;
+        public readonly string Name;
+        public readonly int    DurationMs;
+        public readonly int    OngoingEffectId;
+        public readonly int    StackingPolicy;
+        public readonly int    MaxStacks;
+    }
+}
+```
+
+The same pattern applies to `DRCharacters`, `DRAttributeTemplates`, and every other table in the schema. The `Tables.cs` file provides typed accessors that aggregate all tables: `Tables.TbBuffs`, `Tables.TbCharacters`, `Tables.TbAttributeTemplates`, and so on.
+
+## Runtime Configuration Loading
+
+At runtime, `MobaConfigDatabase` wraps the generic `ConfigDatabase` and exposes strongly typed query methods to gameplay modules. The loading pipeline selects a profile based on the host environment: Unity Resources, a file-system `IConfigSource`, or an in-memory DTO provider for tests.
+
+```csharp
+// Registering the configuration system in the Console DI container
+// src/AbilityKit.Demo.Moba.Console/Bootstrap/ConsoleConfigModule.cs
+
+// The Console host registers:
+//   ITextAssetLoader        → ConsoleTextAssetLoader
+//   IMobaConfigTableRegistry → MobaConfigRegistry.Instance
+//   IMobaConfigDtoDeserializer → JsonNetMobaConfigDtoDeserializer.Instance
+//   LubanConfigGroup
+//   MobaConfigDatabase
+//   TriggerPlanJsonDatabase
+
+// Gameplay code then accesses configuration through the facade:
+MobaConfigDatabase config = /* resolved from DI */;
+if (config.TryGetSkill(skillId, out var skillMO))
+{
+    float castRange = skillMO.CastRange;
+}
+if (config.TryGetBuff(buffId, out var buffMO))
+{
+    int maxStacks = buffMO.MaxStacks;
+}
+```
+
+The `LubanConfigGroupLoader` tries three path variants when loading a table — `resourcesDir/tableName`, `resourcesDir/underscore_case(tableName)`, and the bare `tableName` — making it compatible with both PascalCase and snake_case asset naming.
+
+<Note>
+`LubanConfigGroupDeserializer.DeserializeFromBytes` throws `NotSupportedException`. The Luban group path is a JSON-text adapter only. Binary loading (`ReloadFromBytes` / `ReloadFromMixed`) requires an injected `IMobaConfigDtoBytesDeserializer` such as `LubanMobaConfigDtoBytesDeserializer`.
+</Note>
+
+## Protocol Catalog Compiler
+
+The `tools/AbilityKit.Protocol.CatalogCompiler/` directory contains a standalone .NET console tool that compiles YAML wire schemas into C# source code and MemoryPack (or Protobuf) serialisation adapters.
+
+```text
+tools/
+└── AbilityKit.Protocol.CatalogCompiler/     ← codec-neutral compiler tool
+    └── (MemoryPack backend adapter + Protobuf backend SPI)
+
+Protocols/
+├── Catalogs/
+│   └── *.protocol.yaml                      ← wire schema definitions
+└── WireSchemas/
+    └── *.wire.yaml                           ← message format definitions
+```
+
+Two PowerShell scripts wrap the compiler for day-to-day use:
+
+```powershell
+# Compile protocol catalogs — regenerates BuiltInProtocolCatalogs.g.cs
+# and compatibility metadata projections. -Check validates without writing.
+powershell -ExecutionPolicy Bypass -File tools/compile-protocol-catalogs.ps1
+
+# Export wire schemas — writes MemoryPack-backed C# to Unity protocol packages.
+# -Check validates staleness (exit code 3 if stale); -Strict fails on missing schemas.
+powershell -ExecutionPolicy Bypass -File tools/export-protocol-wire.ps1
+
+# Export Protobuf output for a specific project
+dotnet run --project tools/AbilityKit.Protocol.CatalogCompiler/ -- `
+    --wire-input Protocols/WireSchemas `
+    --project shooter `
+    --export-protobuf artifacts/protobuf
+```
+
+The compiled output is consumed by `ProtocolCatalogRegistry` at runtime. Never hand-edit the generated `BuiltInProtocolCatalogs.g.cs` — it is deterministically regenerated from the YAML source of truth.
+
+## MOBA Code-Generation Package
+
+The `com.abilitykit.demo.moba.codegen` package is a Unity package that contributes a Roslyn `RoslynAnalyzer` DLL. It contains ten generator/analyser pairs that scan MOBA-specific attributes and base classes at compile time and emit deterministic C# manifests — eliminating runtime reflection scanning for config tables, PlanActions, events, queries, projectile launchers, bootstrap stages, and battle routes.
+
+```text
+com.abilitykit.demo.moba.codegen/
+└── DotNet~/AbilityKit.Demo.Moba.CodeGen/
+    ├── Generators/
+    │   ├── MobaConfigTableManifestGenerator.cs
+    │   ├── MobaPlanActionManifestGenerator.cs
+    │   ├── MobaEventMappingManifestGenerator.cs
+    │   ├── MobaSearchQueryFactoryManifestGenerator.cs
+    │   ├── MobaProjectileLauncherManifestGenerator.cs
+    │   └── ... (ten generators total)
+    ├── Analyzers/
+    │   └── (corresponding compile-time diagnostics)
+    └── Contracts/
+        └── (shared between generators and analysers)
+```
+
+The generated partial classes plug into runtime manifest shells:
+
+```csharp
+// Unity/Packages/com.abilitykit.demo.moba.runtime/Runtime/Infrastructure/Config/Core/
+// MobaGeneratedConfigTableManifest.cs  (shell — you add declarations)
+// The generator fills in the AddGenerated(...) partial method with:
+//   DtoTableFactory, EntryTableFactory, ChangedIdCollector
+// for every table class found in the MOBA runtime assembly.
+```
+
+When the generated manifest is empty (e.g., the DLL has not been rebuilt), `MobaGeneratedConfigTableManifest` falls back to reflection scanning. This fallback can be disabled via `AppContext.SetSwitch("AbilityKit.Moba.DisableConfigTableReflectionFallback", true)` for production builds.
+
+## Action Schema and Timeline Data
+
+The `com.abilitykit.actionschema` package defines the contract for expressing timed, parameterised actions as typed data transfer objects. Each `IActionSchema<TActionArgs, TCtx>` implementation declares an `ActionId`, a strongly typed `ArgsType`, a `ParseArgs` method, and a `TryValidateArgs` guard.
+
+```csharp
+// Skill damage action with explicit schema and named parameters
+// (simplified from MOBA gameplay modules)
+
+// In a NamedArgsPlanActionModuleBase-derived module:
+protected override void Register(
+    ActionRegistry actions,
+    ActionSchemaRegistry schemas)
+{
+    actions.Register(ActionId, Execute);
+    schemas.Register(new GiveDamageActionSchema());
+}
+
+private void Execute(
+    ITriggerArgs triggerArgs,
+    GiveDamageArgs typedArgs,
+    IWorldResolver ctx)
+{
+    float damageValue = typedArgs.DamageValue.Resolve(ctx);
+    // ... apply damage
+}
+```
+
+Trigger Plan configs reference actions by `ActionId`; the `MobaTriggerPlanIntegrityValidator` checks at startup that every referenced action has a registered schema and that all named parameters are resolvable.
+
+## Trigger Plan Configuration Format
+
+Trigger Plans are data-driven rule trees stored as JSON. Each plan describes an event binding, execution phase, priority, condition predicate, list of action calls, scheduling policy, and optional presentation cue. They are converted to runtime executable nodes by `ConfigToExecutableConverter` at load time.
+
+```json
+{
+  "TriggerId": 1001,
+  "EventName": "OnBuffAdded",
+  "Phase": "Effect",
+  "Priority": 100,
+  "Predicate": { "Conditions": [] },
+  "Actions": [
+    {
+      "Id": "give_damage",
+      "Args": {
+        "damage_value": { "Const": 150.0 },
+        "target": { "PayloadField": "Target" }
+      }
+    }
+  ],
+  "Schedule": { "Kind": "Transient" },
+  "Scope": "OwnerBound"
+}
+```
+
+The `split_trigger_configs.ps1` script splits monolithic trigger JSON files into per-category single-trigger files (`skills/`, `buffs/`, `passives/`, `misc/`). The `convert_to_source_format.ps1` script adds `$schema`, `metadata`, structured `actions`, and `conditions` fields for editor authoring.
+
+## Full Configuration Flow Summary
+
+Understanding how data moves from authoring to runtime makes it easier to diagnose configuration failures at the right layer.
+
+<Accordion title="Excel → Luban bytes → ThirdParty.Luban.Runtime → typed config objects → gameplay modules">
+
+1. **Authoring** — designers edit Excel files under `LubanConfig/Moba/Production/Datas/`.
+2. **Export** — `export_moba_configs.ps1` runs the Luban CLI and writes JSON candidates to `.generated/json/` and staged C# to `.generated/code/`.
+3. **Review** — a human or automated check approves the JSON and copies it to the package Resources authority (`com.abilitykit.demo.moba.view.runtime/Resources/moba/`).
+4. **Sync** — `sync_moba_json_configs.ps1 -Apply` publishes the package authority to `src/AbilityKit.Demo.Moba.Console/Configs/`.
+5. **Loading** — at runtime, `MobaConfigDatabase` calls `Reload` (or `ReloadFromGroups` for the Luban group path), deserialises JSON or binary bytes into DTO arrays, constructs runtime MO tables using generated factories, and publishes a `ConfigReloadResult`.
+6. **Consumption** — gameplay modules call `config.GetSkill(id)`, `config.TryGetBuff(id, out mo)`, etc. The MO objects provide the typed, validated values the rest of the combat system reads each frame.
+7. **Validation** — `MobaBattleConfigReferenceValidator` and `MobaTriggerPlanIntegrityValidator` run after loading to catch cross-table reference errors, missing schemas, and invalid numeric ranges before the battle starts.
+
+</Accordion>

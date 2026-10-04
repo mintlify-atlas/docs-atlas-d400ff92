@@ -1,0 +1,116 @@
+---
+title: "AbilityKit Network Synchronization Architecture Overview"
+sidebarTitle: "Sync Overview"
+description: "AbilityKit's seven sync capability types, three-layer model, E0–E5 evidence levels, and guidance for choosing frame sync, state sync, or hybrid mode."
+---
+
+AbilityKit's network synchronization layer is not a single preset algorithm. It is a collection of seven composable capability types — from frame value objects and network frame envelopes to authoritative session grains, rollback providers, and record/replay — that projects assemble according to their genre and latency requirements. The MOBA demo uses frame sync as its default, while the Shooter demo uses an authoritative state sync profile with client-side interpolation. Neither is the framework's "default mode"; the final sync mode is always determined by the template and capability declaration committed by the server at battle start.
+
+## The Three-Layer Sync Model
+
+AbilityKit's sync architecture separates concerns across three planes:
+
+**Control Plane** — `com.abilitykit.network.sdk` → Gateway → `com.abilitykit.network.room` (`RoomGatewaySessionFlow`). Handles login, room create/join/restore, member ready/loading/start, and StateSync subscription. Room metadata and capability declarations flow on this connection.
+
+**Battle Data Plane** — `BattleHandle` → independent `NetworkTransport` → `BattleLogicHostGrain` push. In the Shooter demo this is a separate TCP connection used exclusively for per-frame input requests, responses, and snapshot push, keeping battle throughput off the control connection.
+
+**Simulation Layer** — `com.abilitykit.world.framesync` (FrameSync, Rollback), `com.abilitykit.world.snapshot` (FrameSnapshotDispatcher), `com.abilitykit.world.statesync` (StateSync, PredictionCoordinator), `com.abilitykit.record` (Record/Replay). These packages are protocol-neutral; they operate on `FrameIndex`, `PlayerInputCommand`, `FramePacket`, and `WorldStateSnapshot` without depending on TCP, Unity, or Orleans.
+
+## Seven Capability Types
+
+| Capability | Problem Solved | Key Source |
+|---|---|---|
+| Frame value objects | Describe inputs, snapshots, and rollback points with a stable frame number | `com.abilitykit.world.framesync/Runtime` |
+| Network frame envelopes | Carry both player inputs and an optional snapshot in a single object | `com.abilitykit.world.networkfragments/Runtime/Frames/FramePacket.cs` |
+| Remote frame aggregation | Reassemble out-of-order or batched `FramePacket` arrivals into per-frame input and snapshot frames | `RemoteFrameAggregator.cs` |
+| Session and control plane | Execute staged room phases: login → create/join/restore → ready/loading/start → subscribe | `com.abilitykit.network.room/Runtime/RoomGatewaySessionFlow.cs` |
+| Network adaptation | Write `FramePacket` inputs into dual input sources and route snapshots to `FrameSnapshotDispatcher` | `com.abilitykit.host.extension/Runtime/Session/FramePacketNetAdapter.cs` |
+| Server hosting | `RoomGrain` manages membership and battle start; `BattleLogicHostGrain` manages authoritative tick, input buffering, and snapshot push | `Server/Orleans/src/AbilityKit.Orleans.Grains` |
+| Record and replay | Record inputs, state hashes, and snapshots for post-mortem analysis, determinism verification, and regression automation | `com.abilitykit.record/Runtime/Record` |
+
+## Choosing Frame Sync vs. State Sync
+
+<Tabs>
+  <Tab title="Frame Sync">
+    Frame sync replicates **player inputs** across all participants on identical frame numbers. Every client runs the same deterministic simulation given the same inputs, so no snapshot of world state needs to be transmitted every frame — only the inputs.
+
+    **Characteristics:**
+    - Server confirms input batches and an optional per-frame state hash
+    - `BattleFrameSyncGrain` relays input frames at the configured tick rate
+    - `FrameSyncDriverModule` (Host) flushes pending inputs in `PreTick`, ticks the world, then broadcasts `FramePacket` in `PostTick`
+    - Client uses `FramePacketNetAdapter` to write inputs into `RemoteDrivenSink` (jitter-buffered) and `ConfirmedSink` (zero-delay)
+    - State hash mismatch triggers rollback via `RollbackCoordinator`
+
+    **Best for:** MOBA, turn-based or action games where determinism is achievable and input replication is cheaper than full-state snapshots.
+
+    **Key constraint:** Determinism is the project's responsibility. Floating-point arithmetic, container iteration order, and random number generation must all be audited. The framework cannot enforce this for you.
+
+    **Reference demo:** MOBA Console, MOBA Unity (`frame-sync-authority` template, `BattleWorldWithFrameSync` runtime mode).
+  </Tab>
+  <Tab title="State Sync">
+    State sync replicates **authoritative entity state** from the server to clients periodically. The server is the single source of truth; clients apply incoming snapshots, compare against local predictions, and reconcile as needed.
+
+    **Characteristics:**
+    - Server pushes `StateSyncPush` snapshots on a configurable schedule (e.g., full every 30 frames, packed delta every frame)
+    - `FrameSnapshotDispatcher` routes incoming snapshots by `opCode` to typed handlers
+    - `PredictionCoordinator` (or `ClientPredictionReconciliationCoordinator`) manages local prediction slots, input history, and server-state reconciliation
+    - `StateHash` messages allow lightweight drift detection without transmitting full snapshots
+    - Shooter uses a dual-connection setup: Room Gateway for the control plane and an independent `NetworkTransport` for battle data
+
+    **Best for:** Shooters, action games with many entities where determinism is difficult and authoritative state correction is preferred over replication of inputs.
+
+    **Key constraint:** Projects own the full snapshot schema, delta/full switching strategy, entity recovery, interpolation, and AOI logic. The framework provides the pipeline, not the payload.
+
+    **Reference demo:** Shooter Unity (`state-sync-authority` template, `AuthoritativeInterpolation` profile).
+  </Tab>
+  <Tab title="Hybrid">
+    A hybrid approach applies frame sync to the authoritative simulation while using state sync for client-side interpolation of remote entities. AbilityKit's architecture supports this because `FramePacket` carries both inputs and an optional `WorldStateSnapshot` in the same envelope, and `FrameSnapshotDispatcher` is decoupled from the transport layer.
+
+    **Characteristics:**
+    - Local player: frame sync prediction + rollback on input mismatch
+    - Remote entities: authoritative snapshot interpolation via `RemoteInterpolationPlayback`
+    - `FramePacketNetAdapter` writes to both `RemoteDrivenSink` (delayed, for smooth prediction) and `ConfirmedSink` (zero-delay, for reconciliation)
+    - Reliable events (score updates, kill confirmations) flow over the Room control plane; per-frame battle data flows over the dedicated transport
+
+    **Best for:** Games that want low-latency local character response with authoritative results for all game-changing outcomes (damage, kills, spawns).
+
+    **Key constraint:** The project must explicitly define which state domains enter local prediction and which remain purely authoritative. `PredictionCoordinator` provides the primitives but does not decide the policy.
+  </Tab>
+</Tabs>
+
+## Capability Evidence Levels
+
+The AbilityKit codebase uses an evidence hierarchy to describe how production-ready each capability is. When reading the per-topic sync pages, use this table to interpret evidence claims.
+
+| Level | Meaning | Example |
+|---|---|---|
+| **E0** | Type, configuration, or protocol exists in source | Profile builder, codec, strategy enum |
+| **E1** | Clear assembly point or consumer exists | Shooter/MOBA sync session builder, Console session facade |
+| **E2** | Runs in a working project's primary path | Room capability declaration, dual-connection data plane, business prediction/rollback controller |
+| **E3** | Unit or contract tests pass | FrameSync 18/18, StateSync 12/12, Snapshot 7/7, Record 23/23, Network SDK 96/96, Network Room 36/36 |
+| **E4** | Documented smoke/multi-process artifact exists | Shooter/MOBA/Console smoke artifacts — must be verified per run date and configuration |
+| **E5** | CI gate or merge guard is wired | Entries in `tools/test-gates.json` with verified workflow jobs — cannot be inferred from local test passage |
+
+<Note>
+The server's final committed template and `SyncCapabilities` in the Room snapshot are the authoritative source for which sync mode a session uses. Client-side defaults, template name strings, and HTTP catalog display names do not override this. Always verify by checking `RoomNetworkSyncCapabilityResolver` output and client `RoomGatewayNetworkSyncSessionBinding` validation results.
+</Note>
+
+## Navigation
+
+<CardGroup cols={2}>
+  <Card title="Frame Sync" icon="film" href="/networking/frame-sync">
+    Input frame pipeline, `PlayerInputCommand`, `RemoteFrameAggregator`, Orleans relay, and what projects must provide for deterministic simulation.
+  </Card>
+  <Card title="State Sync" icon="server" href="/networking/state-sync">
+    Authoritative snapshot dispatch, `FrameSnapshotDispatcher` routing, `StateHash` drift detection, and the Shooter demo's dual-connection setup.
+  </Card>
+  <Card title="Rollback & Prediction" icon="rotate-left" href="/networking/rollback-prediction">
+    `RollbackCoordinator`, `IRollbackStateProvider`, `PredictionCoordinator`, per-entity rollback, and `ProjectileRollbackProvider`.
+  </Card>
+  <Card title="Record & Replay" icon="circle-dot" href="/networking/replay-record">
+    `RecordContainer`, `EventTrack`, `FrameRecordSink`, `BasicReplayController`, and the three-layer record system.
+  </Card>
+  <Card title="Session & Room" icon="network-wired" href="/networking/session-coordination">
+    `RoomGatewaySessionFlow` stage machine, `RoomGrain` / `BattleLogicHostGrain` Orleans grains, transport options, and the coordinator package boundary.
+  </Card>
+</CardGroup>

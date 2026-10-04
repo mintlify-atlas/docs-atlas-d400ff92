@@ -1,0 +1,248 @@
+---
+title: "AbilityKit Testing Strategy and Quality Gate Pipeline"
+sidebarTitle: "Testing"
+description: "Layered test strategy covering .NET unit tests, Unity EditMode/PlayMode, headless multiplayer smoke scripts, performance gates, and the gate runner."
+---
+
+AbilityKit's test strategy is built around a single principle: verify risks at the cheapest, most stable layer that can catch them. Pure C# unit tests run first without Unity or any server. Unity Editor and PlayMode tests validate the presentation shell. Headless multiplayer scripts confirm end-to-end network closures. Performance gates enforce frame-budget and allocation contracts. The gate runner (`run_test_gate.ps1` + `test-gates.json`) ties every layer into a reproducible, artifact-producing pipeline that runs locally and in CI.
+
+## Test Tiers Overview
+
+AbilityKit organises testing into three main tiers, each serving a distinct risk profile.
+
+<CardGroup cols={3}>
+  <Card title=".NET Unit & Integration" icon="flask">
+    Pure C# xUnit tests covering algorithms, DTOs, DI, protocol, sync logic, and gameplay services. No Unity, no server. Fast feedback for the innermost loop.
+  </Card>
+  <Card title="Unity EditMode / PlayMode" icon="unity">
+    NUnit tests hosted in Unity for in-editor package validation, hero acceptance fixtures, and client-side sync smoke covering the presentation shell.
+  </Card>
+  <Card title="Headless Multiplayer & Smoke" icon="network-wired">
+    PowerShell-driven end-to-end scenarios: MOBA TCP Gateway smoke, Shooter Orleans smoke, ET battle smoke, and the headless Unity multiplayer scripts.
+  </Card>
+</CardGroup>
+
+## Recommended Execution Order
+
+Follow this sequence when evaluating a change. Each step catches a broader set of failures than the one before it.
+
+<Steps>
+  <Step title="Run targeted .NET unit tests">
+    Start with the pure C# project(s) directly affected by the change. Results are precise — failures point to a specific service, DTO, or protocol boundary.
+
+    ```powershell
+    # MOBA skill, buff, trace, and smoke contracts
+    dotnet test src/AbilityKit.Demo.Moba.Tests/AbilityKit.Demo.Moba.Tests.csproj
+
+    # Shooter runtime, acceptance matrix, sync modes
+    dotnet test src/AbilityKit.Demo.Shooter.Runtime.Tests/AbilityKit.Demo.Shooter.Runtime.Tests.csproj
+
+    # Network runtime, DemoHarness, SyncHealthEvent
+    dotnet test src/AbilityKit.Network.Runtime.Tests/AbilityKit.Network.Runtime.Tests.csproj
+
+    # World DI scope, injection, and test injectors
+    dotnet test src/AbilityKit.World.DI.Tests/AbilityKit.World.DI.Tests.csproj
+    ```
+  </Step>
+
+  <Step title="Check the sample catalog golden baseline">
+    Run `check_sample_baseline.ps1` to verify that no refactoring has silently changed what the manifest samples produce. The script runs every sample through the console host, normalises output paths and line endings, and compares the result byte-for-byte against a committed baseline.
+
+    ```powershell
+    # Compare against committed baseline
+    powershell -ExecutionPolicy Bypass -File tools/check_sample_baseline.ps1
+
+    # Regenerate the baseline (review the diff before committing)
+    powershell -ExecutionPolicy Bypass -File tools/check_sample_baseline.ps1 -Update
+    ```
+  </Step>
+
+  <Step title="Run Unity EditMode tests">
+    Launch Unity in batch mode to exercise package-internal validators, code-gen contracts, and hero acceptance fixtures. Use the gate runner to ensure results land in the correct artifact directory.
+
+    ```powershell
+    # Via gate runner (recommended — handles paths and artifact upload)
+    ./tools/run_test_gate.ps1 -Gate moba-xiaoqiao-unity
+
+    # Direct batchmode (always specify -testResults and -logFile)
+    $editor = "C:\Program Files\Unity\Hub\Editor\2022.3.62f1\Editor\Unity.exe"
+    & $editor -batchmode -nographics -projectPath Unity `
+        -runTests -testPlatform EditMode `
+        -testFilter "AbilityKit.Game.Test.UnitTest.ZhaoYunSkillAcceptanceTests" `
+        -testResults local/Logs/unity-manual/zhaoYun.xml `
+        -logFile local/Logs/unity-manual/zhaoYun.log
+    ```
+  </Step>
+
+  <Step title="Run Unity PlayMode tests">
+    PlayMode tests validate the Shooter client-side synchronisation smoke and the presentation-layer projection under real Unity lifecycle conditions.
+
+    ```powershell
+    ./tools/run_test_gate.ps1 -Gate shooter-unity-playmode
+    ```
+  </Step>
+
+  <Step title="Run headless multiplayer scripts">
+    When changes touch the Gateway, Room, or Unity host integration, run the headless multiplayer scripts. Each script clones the Unity project to a second instance and exercises a two-client scenario end to end.
+
+    ```powershell
+    # MOBA Unity headless two-instance multiplayer
+    powershell -ExecutionPolicy Bypass -File tools/run_moba_unity_headless_multiplayer.ps1
+
+    # Shooter Unity headless two-instance multiplayer
+    powershell -ExecutionPolicy Bypass -File tools/run_shooter_unity_headless_multiplayer.ps1
+    ```
+  </Step>
+
+  <Step title="Run end-to-end smoke tests">
+    Smoke tests confirm that individually tested modules cooperate correctly across process boundaries. Pick the script that matches the affected component.
+
+    ```powershell
+    # ET console battle smoke (config gate + determinism signature)
+    powershell -ExecutionPolicy Bypass -File tools/run_et_battle_smoke.ps1
+
+    # MOBA TCP Gateway smoke (two clients, room flow, authority frame)
+    powershell -ExecutionPolicy Bypass -File Server/Orleans/tools/run_moba_smoke.ps1
+
+    # Shooter Orleans smoke (Gateway/Room/BattleGrain/StateSync/replay)
+    powershell -ExecutionPolicy Bypass -File Server/Orleans/tools/run_shooter_smoke.ps1
+    ```
+  </Step>
+</Steps>
+
+## Test Script Reference
+
+The table below lists the key scripts and their purpose. Scripts prefixed `tools/` live in the repository root `tools/` directory.
+
+| Script | Purpose |
+|---|---|
+| `tools/run_test_gate.ps1` | Unified gate runner — interprets `test-gates.json`, produces structured artifacts, and provides the CI entry point for all layers. |
+| `tools/test-gates.json` | Gate definitions (29 gates, schema v6): P0 development blockers, P1 contract blockers, P2 regression baselines. |
+| `tools/check_sample_baseline.ps1` | Golden baseline check — runs every manifest sample and compares normalised output against a committed reference file. |
+| `tools/capture_moba_acceptance_traces.ps1` | Runs Unity MOBA acceptance expectations in batch mode and copies the resulting `_trace.jsonl` files into the dotnet verdict baseline directory (`src/AbilityKit.Demo.Moba.Acceptance.Tests/Traces/`). |
+| `tools/run_moba_unity_headless_multiplayer.ps1` | MOBA Unity headless two-instance multiplayer smoke. |
+| `tools/run_shooter_unity_headless_multiplayer.ps1` | Shooter Unity headless two-instance multiplayer smoke. |
+| `tools/run_et_battle_smoke.ps1` | ET console battle smoke — double-runs with determinism signature comparison, driven by `tools/et-battle-smoke.config.json`. |
+| `tools/run_shooter_aoi_lod_gate.ps1` | Shooter AOI/LOD performance gate — runs threshold checks and exits non-zero on any breach. |
+| `tools/run_shooter_sync_allocation_gate.ps1` | Shooter sync allocation gate — validates per-frame managed allocation stays within the approved budget. |
+| `tools/run_shooter_sync_pipeline_gate.ps1` | Shooter sync pipeline gate — validates P99 frame cost and allocation for state-sync serialisation. |
+| `tools/run_runtime_benchmarks.ps1` | Runtime benchmark runner for package-level and capability-level workloads (attributes, pipeline, triggering, targeting). |
+| `Server/Orleans/tools/run_moba_smoke.ps1` | MOBA TCP Gateway end-to-end smoke: two clients, login, room phases, hero selection, battle start, authority frame validation. |
+| `Server/Orleans/tools/run_shooter_smoke.ps1` | Shooter Orleans smoke: Gateway → Room → BattleGrain → StateSync push → input → late join → reconnect → replay artifact. |
+
+## The Gate Runner
+
+`tools/run_test_gate.ps1` is the single recommended entry point for multi-step test workflows. It reads `tools/test-gates.json`, executes each step in sequence, writes structured artifacts under `local/Logs/test-gates/{timestamp}-{gate}/`, and exits non-zero if any step fails.
+
+```powershell
+# List all available gates
+./tools/run_test_gate.ps1 -List
+
+# Run the default precheck gate (P0)
+./tools/run_test_gate.ps1
+
+# Run a specific gate
+./tools/run_test_gate.ps1 -Gate moba-console-smoke
+
+# Run a specific step within a gate (useful for debugging)
+./tools/run_test_gate.ps1 -Gate regression -StepName "AOI LOD smoke"
+
+# CI mode — suppresses progress bars and --nologo
+./tools/run_test_gate.ps1 -Gate precheck -CI
+```
+
+Each gate run produces a `gate-summary.json` with stable machine-readable fields (`status`, `startedAt`, `endedAt`, `elapsedSeconds`, `steps[].exitCode`). CI jobs upload this directory via `actions/upload-artifact@v4` with `if: always()` so artifacts are preserved even when the gate fails.
+
+<Note>
+Gate level (P0 / P1 / P2) indicates risk priority, not CI trigger timing. Always read the `ciPolicy` field in `test-gates.json` to determine which events (pull request, push, schedule) actually trigger a gate in the workflow. The workflow in `.github/workflows/abilitykit-test-gates.yml` is the authoritative source for which gates are automatically enforced.
+</Note>
+
+## ET Battle Smoke
+
+The ET smoke script exercises the ET console battle path with a data-driven configuration. Before running any battle frames, it validates the config gate; on completion it compares the `DeterminismSignature` across two runs to confirm deterministic output.
+
+```powershell
+# Run with default config (tools/et-battle-smoke.config.json)
+powershell -ExecutionPolicy Bypass -File tools/run_et_battle_smoke.ps1
+
+# Override individual parameters
+powershell -ExecutionPolicy Bypass -File tools/run_et_battle_smoke.ps1 `
+    -SmokeFrames 300 -ConsistencyRuns 2
+```
+
+The config file (`tools/et-battle-smoke.config.json`) specifies frame count, timeout, drain frames, consistency run count, and per-case paths:
+
+```json
+{
+  "SmokeFrames": 600,
+  "MinBattleFrames": 30,
+  "TimeoutMilliseconds": 15000,
+  "ConsistencyRuns": 2,
+  "SmokeCasePaths": [
+    "tools/et-battle-smoke.case.damage.json",
+    "tools/et-battle-smoke.case.self-bleed-trace.json"
+  ]
+}
+```
+
+## Performance Gates
+
+AbilityKit enforces three Shooter-specific performance gates. Each exits with a non-zero code on any threshold breach, making them suitable as hard CI blockers.
+
+| Gate Script | What It Measures | Key Parameters |
+|---|---|---|
+| `run_shooter_aoi_lod_gate.ps1` | AOI culling and LOD budget CPU cost per entity at varying observer counts | `-Profile smoke\|full`, `-OutputPath` |
+| `run_shooter_sync_allocation_gate.ps1` | Per-frame managed allocation during state-sync serialisation | `-Entities`, `-MaxP99Milliseconds`, `-MaxAllocatedBytes` |
+| `run_shooter_sync_pipeline_gate.ps1` | P99 frame cost and allocation for state-sync pipeline execution | `-Snapshot full\|delta`, `-Entities`, `-MaxP99Milliseconds` |
+
+```powershell
+# Shooter AOI/LOD gate (smoke profile — runs in PR pipeline)
+powershell -ExecutionPolicy Bypass -File tools/run_shooter_aoi_lod_gate.ps1 -Profile smoke
+
+# Shooter sync allocation gate
+powershell -ExecutionPolicy Bypass -File tools/run_shooter_sync_allocation_gate.ps1 `
+    -Entities 2000 -MaxAllocatedBytes 4194304
+
+# Shooter sync pipeline gate
+powershell -ExecutionPolicy Bypass -File tools/run_shooter_sync_pipeline_gate.ps1 `
+    -Snapshot delta -Entities 1000
+```
+
+<Warning>
+Performance gate thresholds are environment-specific. Results from a shared CI host with variable load can differ significantly from a dedicated benchmark machine. Do not promote a threshold to an enforced gate (`P1` blocker) until you have confirmed reproducibility across multiple runs on the target environment.
+</Warning>
+
+## Skill Testing Scaffolding
+
+The `com.abilitykit.ability.testkit` package provides scaffolding for writing unit and integration tests against skill pipelines without starting a full world. It exposes lightweight fixture helpers that let tests construct the minimal dependency graph a skill or buff needs, submit inputs through `IMobaBattleInputPort`, and assert against stable fields — `SkillCast` trace events, `EffectExecution` trace records, accepted command counts, and `MobaInputSubmitFailureCode` values.
+
+<Tip>
+When writing skill tests, prefer asserting against structured stable fields (enum codes, trace kinds, config IDs, frame numbers) rather than log strings. This keeps the test suite resilient to copy changes and makes CI failures immediately machine-parseable.
+</Tip>
+
+## Roslyn Analyzer
+
+The `com.abilitykit.analyzer` package ships a Roslyn analyzer DLL loaded by Unity as a `RoslynAnalyzer` asset. It enforces architectural boundary rules at compile time using JSON-driven constraint definitions:
+
+- `ForbiddenNamespaceAnalyzer` — blocks cross-layer namespace references that would violate the three-layer model (Framework Mechanism → Project Application → Host).
+- `ConfigTableDefinitionAnalyzer` — validates that config table attributes and factory registrations satisfy the required structural contract.
+
+Constraint rules are declared in JSON configuration files and are editable through the **Window → AbilityKit → Constraint Settings** editor window. Violations appear as compile errors in both Unity and any IDE with Roslyn support. This means architectural boundary enforcement runs continuously during development, not only in CI.
+
+## Artifact Directory Layout
+
+All test artifacts must be written to `local/Logs/` locally. The CI workflow overrides the output path to `artifacts/test-gates/` for upload, but that path must never be used as a local default.
+
+```
+local/Logs/
+├── test-gates/                          ← gate runner output
+│   └── {yyyyMMdd-HHmmss}-{Gate}/
+│       ├── gate-summary.json
+│       ├── 01-{StepName}.log
+│       ├── test-results/                ← TRX files
+│       └── unity-results/               ← NUnit XML + log
+├── headless/                            ← ad-hoc Unity headless runs
+├── moba-acceptance/                     ← MOBA acceptance traces and summaries
+├── moba-console-smoke/                  ← console smoke trace JSONL
+└── dotnet/                              ← direct dotnet test TRX files
+```

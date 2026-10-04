@@ -1,0 +1,127 @@
+---
+title: "Session and Room Coordination in AbilityKit Multiplayer"
+sidebarTitle: "Session & Room"
+description: "RoomGatewaySessionFlow stages, RoomGrain, BattleLogicHostGrain, transport options, and the coordinator package contract boundary versus project ownership."
+---
+
+Session coordination in AbilityKit bridges the gap between "a player wants to start a game" and "a local world is advancing in lockstep with the authoritative server." This span involves identity verification, room lifecycle management, a staged loading handshake, battle initialization on Orleans grains, client-side transport wiring, and reconnect recovery. AbilityKit distributes these responsibilities across several packages with explicit ownership boundaries, rather than providing a single coordinator class that performs all steps automatically.
+
+## Relevant Packages
+
+- **`com.abilitykit.network.sdk`** — `NetworkSyncSessionBuilder`, `ReliableEventSessionBuilder`, profile negotiation
+- **`com.abilitykit.network.room`** — `RoomGatewaySessionFlow`, `GatewayMultiplayerSession`, `RoomGatewayNetworkSyncSessionBinding`
+- **`com.abilitykit.coordinator`** — `SessionConfig`, `ISessionCoordinatorHost`, `ISessionCoordinatorConfigPolicy`, `ILogicWorldDriveGate`, payload DTOs (contracts and value objects only)
+- **`com.abilitykit.network.battle`** and **`com.abilitykit.game.battle.runtime`** — Battle data plane for business session assembly
+- **Server** — `RoomGrain` (Orleans), `BattleLogicHostGrain` (Orleans), `BattleFrameSyncGrain` (Orleans)
+
+<Warning>
+`com.abilitykit.coordinator` is a **contracts-only package**. It contains `SessionConfig`, `SessionEnums`, `SessionId`, host/policy interfaces (`ISessionCoordinatorHost`, `ISessionCoordinatorConfigPolicy`), drive gate interfaces, and data DTOs (`CoordinatorPayloadCodec`, `EntityState`, `FrameSnapshotData`, `NetworkEndpoint`, `PlayerInput`). It does **not** contain a `SessionCoordinator` class, a `LocalSyncAdapter`, `RemoteSyncAdapter`, or `HybridSyncAdapter`, an `ExistingWorldSessionCoordinatorHost`, or any `IRemoteBattleSyncTransport` implementation. Those were historical design experiments found only in the Console demo's `Battle/Sync` folder and are not public API. Do not attempt to instantiate or reference them from a new project integration.
+</Warning>
+
+## Control Plane vs. Battle Data Plane
+
+AbilityKit maintains a strict separation between two connection types:
+
+**Control Plane** — Managed by `RoomGatewaySessionFlow` (in `com.abilitykit.network.room`) over a Room Gateway connection. Handles room create/join/restore, member ready/loading/start, and `SubscribeStateSyncAsync`. Also used for reliable event acknowledgment, full-state baseline RPC, and Room recovery after reconnect.
+
+**Battle Data Plane** — In the Shooter demo, a second independent `NetworkTransport` carries per-frame input request/response (inline matched, no main-thread pump required) and snapshot push delivery. Battle push subscribers are registered only on the data transport. The control connection must not have an active duplicate snapshot subscription.
+
+This two-connection topology is the Shooter demo's established pattern. The MOBA demo uses only the Room control connection for its frame sync mode.
+
+## `RoomGatewaySessionFlow`: The Stage Machine
+
+`RoomGatewaySessionFlow` orchestrates the Room control plane by exposing atomic, independently callable stage methods. It does not own the local world, drive battle frames, or hold transport references.
+
+```csharp
+public sealed class RoomGatewaySessionFlow
+{
+    public RoomGatewaySessionFlow(IRoomGatewaySessionClientBase client) { /* ... */ }
+
+    public Task<string> CreateRoomAsync(string sessionToken, RoomGatewayLaunchSpec launchSpec, ...) { /* ... */ }
+    public Task<RoomGatewayJoinResult> JoinRoomAsync(string sessionToken, string region, string serverId, string roomId, ...) { /* ... */ }
+    public Task<RoomGatewayReadyResult> SetReadyAsync(...) { /* ... */ }
+    public Task BeginLoadingAsync(...) { /* ... */ }
+    public Task ReportAssetsLoadedAsync(...) { /* ... */ }
+    public Task<RoomGatewayBattleStartResult> WaitForBattleStartAsync(...) { /* ... */ }
+    public Task<RoomGatewaySubscribeResult> SubscribeStateSyncAsync(...) { /* ... */ }
+    public Task<RoomGatewayStagedRestoreResult> RestoreAsync(...) { /* ... */ }
+}
+```
+
+Each stage is independent and returns a strongly typed result. Business sessions compose these stages to match their room interaction model. MOBA uses the staged flow with hero-pick, loading, and recovery phases. The Shooter demo uses a more linear path toward battle start.
+
+## Typical Session Flow
+
+<Steps>
+  <Step title="Login">
+    The client authenticates with the Gateway and receives a `sessionToken`. This token is passed to every subsequent Room RPC to validate identity and authorize requests.
+  </Step>
+  <Step title="Join Room">
+    Call `RoomGatewaySessionFlow.JoinRoomAsync`. If the result indicates `Reconnect` or `LateJoin` (meaning a battle is already running), skip the ready/loading stages and proceed directly to `SubscribeStateSyncAsync` with the existing `WorldStartAnchor`.
+  </Step>
+  <Step title="Ready and Load">
+    Call `SetReadyAsync`, then `BeginLoadingAsync` to freeze the roster and increment `Launch.Generation`. Each member calls `ReportAssetsLoadedAsync` when assets are loaded. After the last member reports, the Room automatically commits the battle start.
+  </Step>
+  <Step title="Start Battle">
+    `WaitForBattleStartAsync` returns once the Room has committed the battle. The result contains `BattleId`, `WorldId`, and `WorldStartAnchor`. `BattleLogicHostGrain` is initialized at this point with the final sync template, tick rate, and input delay configuration.
+  </Step>
+  <Step title="Receive Snapshots">
+    Call `SubscribeStateSyncAsync` (carrying `eventEpoch` and `lastEventAck` for reliable event recovery). Shooter clients simultaneously establish the independent `NetworkTransport` for battle data. From this point, `BattleLogicHostGrain.OnTickAsync` runs on the Orleans timer, drains `BattleInputBuffer`, ticks `IBattleRuntimeSession`, and pushes snapshots via `IStateSyncObserverGrain.OnSnapshotPushedAsync`.
+  </Step>
+  <Step title="Disconnect">
+    Closing the connection does not call `LeaveRoom`. The Room records the member as offline and starts a grace-period timer. The client can `RestoreAsync` within the window to resume without losing room state. After all real clients are offline for one minute, the Room abandons the session and cascades cleanup to `BattleLogicHostGrain` and `BattleFrameSyncGrain`.
+  </Step>
+</Steps>
+
+## Room Metadata and Capability Declaration
+
+`RoomGrain` writes the final sync template and `SyncCapabilities` into its persistent state at battle commit time. `RoomNetworkSyncCapabilityResolver` maps the template to the client-visible capability metadata. The client's `RoomGatewayNetworkSyncSessionBinding` validates the metadata version, policy bits, and profile name on reconnect and rejects unknown versions, missing required capabilities, and profile mismatches.
+
+The MOBA module always declares the `Lockstep` profile with schema `0..1`. The Shooter module declares `AuthoritativeInterpolation` as its default, with other profiles (`PredictRollback`, `BatchStateSync`, etc.) available per template. **Do not use template name strings as a proxy for capability bits** — always read the committed `SyncCapabilities` from the Room snapshot.
+
+## `com.abilitykit.network.sdk` Facade
+
+`NetworkSyncSessionBuilder<TController, TContext>` assembles a sync session from a stable Profile, a frozen capability catalog, local capability validation, and the Room's declared capabilities. It processes each declared capability with one of three strategies:
+
+- `Ignore` — the capability is present but not used by this client
+- `NegotiateWhenAvailable` — use the capability if the server declares it, fall back gracefully otherwise
+- `Require` — fail session creation if the server does not declare this capability
+
+The builder returns a controller and an immutable descriptor. It does not decide prediction, interpolation, rollback, or authoritative simulation algorithms. Controller factory exceptions propagate unchanged — projects should convert them to explicit session entry failures rather than silently falling back to a different gameplay mode.
+
+## `RoomGrain` and `BattleLogicHostGrain` (Orleans)
+
+`RoomGrain` owns the **room domain**: member identity, online/offline status, ready state, hero pick, roster freeze, commit generation, late join, reconnect, and room abandonment cleanup. It does not drive battle frames.
+
+`BattleLogicHostGrain` owns the **battle domain**: initializing the `IBattleRuntimeSession`, running the Orleans timer, draining `BattleInputBuffer`, calling `IBattleRuntimeSession.Tick`, and pushing snapshots to `IStateSyncObserverGrain` subscribers. `BattleInputFrameScheduler` accepts, remaps, or rejects each `SubmitInputAsync` call based on the current authoritative frame and input delay configuration.
+
+`BattleFrameSyncGrain` handles the **pure frame sync broadcast route**. It stores inputs by frame number and pushes `FramePushedEvent` to all subscribers at the configured tick rate via an Orleans timer. It is initialized by `RoomGrain.StartBattleAsync` only when the gameplay template declares frame sync support.
+
+## Transport Options
+
+AbilityKit supports several transport implementations for different deployment needs:
+
+| Transport | Use Case |
+|---|---|
+| **TCP (mainline)** | Production multiplayer; used by both MOBA and Shooter in deployed scenarios |
+| **InMemory** | Unit and integration tests; simulates network without real sockets |
+| **LiteNet** | Optional UDP-based transport for lower-latency scenarios |
+| **WebSocket** | Optional transport for browser-compatible clients |
+
+Transport selection is a project-level configuration decision. The framework's `FramePacket`, `RemoteFrameAggregator`, and `FrameSnapshotDispatcher` are transport-agnostic — they operate on deserialized objects, not on raw socket bytes.
+
+## Recovery: Restore, Late Join, and Reconnect
+
+`RoomGatewaySessionFlow.RestoreAsync` performs a structured restore sequence:
+1. Validates the session token, region, server ID, and player ID.
+2. Calls `RestoreRoomAsync` to reestablish membership.
+3. Reads `GetSnapshotAsync` to obtain the current room phase.
+4. Returns a `RoomGatewayStagedRestoreNextStep` indicating where to resume: `Lobby`, `Loading`, `Starting`, or `InBattle`.
+
+Business sessions use `NextStep` to resume from the correct stage without replaying already-completed phases. An `InBattle` restore carries the same `eventEpoch` and `lastEventAck` needed to restore the reliable event cursor, preventing duplicate or dropped reliable events after reconnect.
+
+Structured error codes (`NoActiveRoom`, `NotMember`, `RoomClosed`, `RoomExpired`, `InvalidSession`, `Timeout`, `InternalError`) replace unified exception throws. `Timeout` and `InternalError` are retriable; the others require returning to the lobby or login screen.
+
+<Info>
+`GatewayMultiplayerSession` is a one-shot facade over `RoomGatewaySessionFlow` for linear, minimal room flows. Its `Dispose` does not call `LeaveRoom`. Reconnection after dispose requires constructing a new session or driving the staged restore path explicitly. It is appropriate for the Console demo and simple Shooter flows, but not for MOBA's hero-pick, phased loading, and recovery model.
+</Info>

@@ -1,0 +1,202 @@
+---
+title: "Skill Pipeline: Orchestrating Multi-Phase Skill Flow"
+sidebarTitle: "Skill Pipeline"
+description: "How com.abilitykit.pipeline orchestrates skill execution through composable phase graphs — Sequence, Parallel, Conditional, Delay, Repeat, WaitUntil, and Timeline."
+---
+
+The Skill Pipeline answers one concrete question: **how is a skill's execution flow orchestrated across frames?** Rather than encoding a MOBA skill as a monolithic executor, AbilityKit represents each skill as a directed graph of phases that advance through time, pause on input, interrupt on cancellation, and compose into arbitrarily complex multi-stage abilities. The `com.abilitykit.pipeline` package provides those building blocks as pure C# types, independently testable and usable on servers, consoles, and editors alike.
+
+## Package
+
+`com.abilitykit.pipeline`
+
+<Note>
+The Pipeline package is compiled directly from Unity package source by `src/AbilityKit.Pipeline/AbilityKit.Pipeline.csproj`, so all framework mechanics are available in non-Unity .NET projects without modification.
+</Note>
+
+## Core Abstractions
+
+The pipeline runtime is built on a small set of stable interfaces. Every phase and pipeline variant is composed from these types.
+
+<Accordion title="IAbilityPipelinePhase&lt;TCtx&gt;">
+
+The fundamental phase contract. Any step — instantaneous or multi-frame — implements this interface.
+
+```csharp
+public interface IAbilityPipelinePhase<TCtx>
+    where TCtx : IAbilityPipelineContext
+{
+    AbilityPipelinePhaseId PhaseId { get; }
+    bool IsComplete { get; }
+    bool IsComposite { get; }
+    IReadOnlyList<IAbilityPipelinePhase<TCtx>> SubPhases { get; }
+
+    bool ShouldExecute(TCtx context);
+    void Execute(TCtx context);
+    void OnUpdate(TCtx context, float deltaTime);
+    void Reset();
+    void HandleError(TCtx context, Exception exception);
+}
+```
+
+</Accordion>
+
+<Accordion title="IAbilityPipelinePhaseInstanceFactory&lt;TCtx&gt;">
+
+Stateful phases that must be isolated per-run implement this factory. On each `AbilityPipeline.Start`, the runtime calls `CreateRunPhase()` to get a run-local instance instead of reusing the definition object.
+
+```csharp
+public interface IAbilityPipelinePhaseInstanceFactory<TCtx>
+    where TCtx : IAbilityPipelineContext
+{
+    IAbilityPipelinePhase<TCtx> CreateRunPhase();
+}
+```
+
+</Accordion>
+
+<Accordion title="AbilityCompositePhase&lt;TCtx&gt; and PipelineGraph">
+
+Composite phases group child phases. The static `PipelineGraph` class is the canonical builder for all built-in phase types:
+
+```csharp
+// Sequence — children run one after another
+var seq = PipelineGraph.Sequence(phaseA, phaseB, phaseC);
+
+// Parallel — all children run simultaneously, completes when all finish
+var par = PipelineGraph.Parallel(animPhase, logicPhase);
+
+// Conditional — chooses a branch based on a condition node
+var cond = PipelineGraph.Conditional(condition, whenTrue, whenFalse);
+
+// Delay — waits a fixed number of seconds
+var delay = PipelineGraph.Delay(0.5f);
+
+// WaitUntil — polls a predicate each frame, optional timeout
+var wait = PipelineGraph.WaitUntil(ctx => ctx.IsReleased, timeout: 2f);
+
+// Repeat — runs a phase (or action) N times with an optional interval
+var repeat = PipelineGraph.Repeat(phase, repeatCount: 3, interval: 0.1f);
+```
+
+</Accordion>
+
+## Phase Type Reference
+
+<Steps>
+  <Step title="Sequence">
+    Executes child phases one after another in declaration order. Each child must complete before the next begins. The sequence itself completes when its last child finishes. This is the most common structure for a charged-cast skill: Gate → Windup → Cast.
+  </Step>
+  <Step title="Parallel">
+    Starts all eligible children simultaneously within the same tick and advances each every frame. Completes when **all** children complete. Useful for running animation and logic phases concurrently, or for skills that simultaneously apply an effect and play a VFX cue.
+  </Step>
+  <Step title="Conditional / Gate">
+    `AbilityConditionalPhase` evaluates an `IAbilityConditionNode` on entry and routes to a true-branch or an optional false-branch. `AbilityGatePhase` blocks advancement until its condition becomes true, acting as a per-tick guard. Both support `EConditionCheckStrategy.OnEnter` and continuous re-evaluation.
+  </Step>
+  <Step title="Delay">
+    `AbilityDelayPhase` accumulates `deltaTime` until the configured seconds have elapsed, then completes immediately. Suitable for fixed-duration cast windows, animation holds, or frame-accurate event timing.
+  </Step>
+  <Step title="WaitUntil">
+    `AbilityWaitUntilPhase` polls a `Func<TCtx, bool>` predicate every frame. Accepts an optional timeout and a flag controlling whether timeout triggers completion or failure. Used in MOBA configs for waiting on a held input (`ObservedSlotsIdle`) before proceeding.
+  </Step>
+  <Step title="Repeat">
+    `AbilityRepeatPhase` loops its inner phase a fixed number of times (or indefinitely when `repeatCount == -1`) with an optional per-iteration interval. Suitable for channeled abilities that fire at regular intervals.
+  </Step>
+  <Step title="Timeline">
+    `AbilityTimelinePhase` drives event points at millisecond-level precision against an elapsed timer. The MOBA demo uses this for in-frame skill events (projectile launch at 200 ms, hitbox active at 350 ms, recovery at 800 ms) via the project-layer `SkillTimelinePhase`.
+  </Step>
+</Steps>
+
+## Pipeline Lifecycle
+
+A single `AbilityPipeline<TCtx>` definition can be started multiple times. Each call to `.Start(config, context)` produces a one-shot `IAbilityPipelineRun<TCtx>` that owns execution for that run.
+
+```csharp
+// Framework interfaces — source: com.abilitykit.pipeline
+// IAbilityPipelineRun<TCtx> — handle returned by AbilityPipeline.Start(...)
+// IAbilityPipelineContext — shared data, phase ID, state, and interrupt fields
+```
+
+The host is responsible for calling `run.Tick(deltaTime)` every logical frame. Each tick advances the current cross-frame phase via `OnUpdate`, then synchronously executes any follow-on phases that complete instantly, stopping only when a cross-frame phase is reached or the pipeline terminates.
+
+<Tabs>
+  <Tab title="States">
+
+    | State | How to reach it |
+    |-------|----------------|
+    | **Executing** | Set immediately on `Start`; the only "live" state |
+    | **Paused** | `run.Pause()` — note: `State` enum stays `Executing`; check `run.IsPaused` |
+    | **Completed** | All phases finished without error |
+    | **Failed** | Exception, `context.IsAborted`, `run.Interrupt()`, or a `Cancel` processed on the next tick |
+
+  </Tab>
+  <Tab title="Control Operations">
+
+    | Operation | Semantics |
+    |-----------|-----------|
+    | `run.Pause()` | Sets `IsPaused`; tick still required but no phase is advanced |
+    | `run.Resume()` | Clears `IsPaused`; idempotent if not paused |
+    | `run.Interrupt()` | Notifies current interruptible phase, sets `IsAborted`, enters `Failed` immediately |
+    | `run.Cancel()` | Marks cancel request; `Failed` on **next** `Tick` |
+
+  </Tab>
+</Tabs>
+
+## Pipeline vs. Triggering
+
+<Info>
+The Pipeline answers **when to advance** — it owns frame-level sequencing, pause, interrupt, and cross-frame timing. The Triggering system answers **what to do when an event fires** — it owns condition evaluation, action execution, and event-driven reactions.
+
+A typical skill uses both: the Pipeline orchestrates phases (Windup → Cast → Recovery), and each phase can publish events or invoke Trigger plans to drive GameplayEffect application, projectile spawning, and damage calculation.
+</Info>
+
+## Trace, Registry, and Diagnostics
+
+`PipelineRuntime` composes a `PipelineRegistry` and a pluggable `IPipelineTraceRecorder`. By default the recorder is a no-op. Enabling a concrete recorder lets you observe run start/end, phase start/complete/error, pause, resume, and interrupt — useful for replay validation and diagnostic dashboards.
+
+```csharp
+// PipelineRuntime — source: com.abilitykit.pipeline Runtime/PipelineRuntime.cs
+// PipelineRegistry — source: com.abilitykit.pipeline Runtime/Lifecycle/PipelineRegistry.cs
+// IPipelineTraceRecorder — source: com.abilitykit.pipeline Runtime/Debug/
+```
+
+<Warning>
+`PipelineRegistry.InterruptAll()` broadcasts a global interrupt event but does **not** call `Interrupt()` on individual built-in runs. For reliable shutdown, hold your own run handles and interrupt them explicitly before a world teardown.
+</Warning>
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Press / Hold / Release Casting" icon="hand-pointer">
+    A `WaitUntil` phase waits for input release; a `Gate` checks resource cost. The project layer maps press/hold/release semantics in `SkillCastCoordinator` on top of the framework's phase primitives.
+  </Card>
+  <Card title="Multi-Phase Skills" icon="layer-group">
+    A `Sequence` of Windup → `Parallel(Animation, Logic)` → Recovery expresses the canonical ARPG/MOBA skill without writing frame management code.
+  </Card>
+  <Card title="Charge and Release" icon="bolt">
+    A `Repeat` phase accumulates charge ticks; a `WaitUntil` waits for the player to release; a final action phase fires the charged shot.
+  </Card>
+  <Card title="Parallel Animation + Logic" icon="arrows-split-up-and-left">
+    `Parallel` runs an animation phase alongside a logic phase. Each operates independently; completion requires both to finish.
+  </Card>
+  <Card title="Timeline Events" icon="clock">
+    `AbilityTimelinePhase` fires frame-accurate events for projectile launch, hitbox activation, and VFX triggers — driven by millisecond timestamps in config.
+  </Card>
+  <Card title="MOBA Config-Driven Pipelines" icon="sliders">
+    `TableDrivenMobaSkillPipelineLibrary` translates `SkillFlowMO` config into `IAbilityPipelinePhase` instances at startup. The runner consumes already-built phases and never touches config at runtime.
+  </Card>
+</CardGroup>
+
+## Instant Pipeline
+
+For one-shot synchronous use — validation, immediate effects, pre-cast checks — use `InstantAbilityPipeline<TCtx>`. It runs all phases synchronously in `RunToCompletion` and fails immediately if any phase does not complete in a single call.
+
+```csharp
+// InstantAbilityPipeline<TCtx>
+// Source: com.abilitykit.pipeline Runtime/Core/Pipeline/InstantAbilityPipeline.cs
+// Does not register a run handle; does not call ReleaseContext; no trace recorder integration
+```
+
+<Note>
+`InstantAbilityPipeline` and `AbilityPipeline` have intentionally different ownership, event, and observability semantics. Do not assume they are interchangeable.
+</Note>

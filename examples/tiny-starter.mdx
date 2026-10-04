@@ -1,0 +1,145 @@
+---
+title: "Tiny Starter: Minimal Path to a Live Multiplayer Game"
+sidebarTitle: "Tiny Starter"
+description: "Walk from deterministic rules through Room, State Sync, Frame Sync, Hybrid Sync, and Recovery to a fully networked project with the Tiny tutorial series."
+---
+
+The Tiny Starter is AbilityKit's minimal learning path. It uses a deliberately simple two-player battle — integer-coordinate movement and a single cooldown-gated attack — to demonstrate every layer of the sync stack without the noise of a full game. The rules are kept trivially simple so that the interesting parts are the Room lifecycle, sync mechanisms, rollback, recovery, and project assembly. By the end of the tutorial series you have a dual-client networked game running against a real Gateway, validated with independent .NET processes and headless Unity.
+
+<Info>
+Tiny intentionally leaves **input semantics, combat rules, gameplay modules, and presentation** undefined — those are for your project to decide. Tiny only demonstrates sync mechanism integration. The goal is for you to understand which parts the framework provides and which parts you own.
+</Info>
+
+## Tutorial Chapter Structure
+
+The tutorial lives in `Docs/tutorials/tiny/` and is organized into ten chapters. Follow the recommended path below — you do not need to complete every branch before moving on:
+
+<Steps>
+  <Step title="Chapter 01 — Rules and Determinism">
+    Implement `TinyInput`, `TinyBattle`, `TinyBattleState`, `TinyBattleStateCodec`, and a deterministic hash. No framework packages required — just pure C# in `com.abilitykit.demo.tiny.logic`. Run the sample with `dotnet run --project src/AbilityKit.Demo.Tiny.Logic.Sample` to verify that the same input produces the same hash on both Unity and .NET.
+  </Step>
+  <Step title="Chapter 02 — Room and Connection">
+    Add the Network SDK and Room flow. Learn how clients create, join, and ready rooms. Introduces `TinyBattleSession` and `TinyGatewayClient`. The standalone `src/AbilityKit.Demo.Tiny.RoomSample` project provides a dual-client .NET validation entry.
+  </Step>
+  <Step title="Chapter 03 — State Sync">
+    Subscribe to authoritative snapshots, negotiate the `StateCapability`, wait for a full baseline, and project two actor objects from a single authority frame. `TinyActorViewModule` handles the Unity-side projection. The standalone `src/AbilityKit.Demo.Tiny.StateSample` project validates this path end-to-end. **Current State mode does not include local state prediction or rollback** — that is Chapter 05.
+  </Step>
+  <Step title="Chapter 04 — Frame Sync and Rollback">
+    Add `InputHistoryRingBuffer`, `RollbackSnapshotRingBuffer`, `WorldStateHashRingBuffer`, and `RollbackCoordinator`. Learn why a late authority frame triggers a replay and how hash mismatch triggers a full-snapshot request. The `src/AbilityKit.Demo.Tiny.FrameSample` dual-client project verifies authoritative convergence. If the authority frame arrives before a rollback window forms, the rollback count may be zero — this is correct behaviour, not a failure.
+  </Step>
+  <Step title="Chapter 05 — Hybrid Sync">
+    Layer local input prediction on top of the frame-sync rollback session. Periodic snapshot validation corrects divergence without a full rollback. The `src/AbilityKit.Demo.Tiny.HybridSample` project validates prediction and correction. Note that this hybrid mode is "frame-input prediction + periodic snapshot check" — it is not an independent state-sync prediction rollback implementation.
+  </Step>
+  <Step title="Chapter 06 — Recovery and Exceptions">
+    Study four fault scenarios: overflow, stale frame, missing history, and socket loss. Learn how the framework's connection restore flow, frame inbox, and full-snapshot cursor let clients resume seamlessly. The `src/AbilityKit.Demo.Tiny.RecoverySample` project covers all four faults, and the three-mode comprehensive TCP recovery test verifies them together.
+  </Step>
+  <Step title="Chapter 07 — Formal Project Assembly">
+    Compose a Unity project with a loading pipeline, scene management, and server-side module registration via `ServerGameplayModuleCatalog.Default.WithModule(TinyServerGameplayModule.Create())`. Both Starter-mode and Starter-free (`TinyProjectLaunch.Open`) entry points are covered. This is the chapter that produces a properly assembled game, not just a network sample.
+  </Step>
+  <Step title="Chapter 08 — Cross-Layer Rule Change Exercise">
+    Practice changing a game rule (for example, adding a cooldown to movement) and trace its impact through the logic layer, server module, TCP sample, and test suite. Verifies that your project boundaries are maintainable.
+  </Step>
+  <Step title="Chapter 09 — Recording and Protocol Evolution">
+    Record inputs, snapshots, and hashes offline with `Tiny.Record.Sample`, then replay them. `Tiny.LiveRecord.Sample` records against a real Gateway State session. `Tiny.ProtocolEvolution.Sample` demonstrates V1/V2 compatibility reads and Room capability negotiation rejecting schema-incompatible clients.
+  </Step>
+  <Step title="Chapter 10 — Battle Rhythm Variants">
+    Compare local turn-based ownership with real-time fixed-tick multiplayer. `TinyTurnGameplayModule` uses its own turn rules and State template. `Tiny.Turn.StateSample` runs a dual-process match with move validation, reconnect, alternating actions, and a winner snapshot. The optional `com.abilitykit.demo.tiny.turn` package provides the Unity scene and headless PlayMode acceptance.
+  </Step>
+</Steps>
+
+## Runnable Sample Projects
+
+Each chapter has at least one independently runnable .NET or Unity project. The key standalone project for Chapter 03 is `src/AbilityKit.Demo.Tiny.StateSample`, which runs a Room + State dual-client network test without Unity:
+
+```bash
+dotnet run --project src/AbilityKit.Demo.Tiny.StateSample
+```
+
+This project requires a running Host and Gateway. Use the server template (see below) or the `tools/verify-tiny-starter.ps1` script, which manages server lifetime automatically.
+
+## Consumer Template
+
+The Unity consumer template (`tools/tiny-consumer-template/`) is generated by:
+
+```bash
+tools/create-tiny-validation-project.ps1 -Standalone
+```
+
+It embeds the full Tiny package closure including its own `ConsumerLobby` scene and has no dependency on the Starter package or this repository's absolute paths. The MemoryPack Unsafe assembly is provided by `com.abilitykit.thirdparty.unsafe` — no source DLLs are copied into `Assets`.
+
+`TinyConsumerLobby.Enter(authenticatedLaunch)` is the project-owned entry point into `TinyProjectLaunch.Open`. A real project supplies a valid `DemoMultiplayerLaunchRequest` from its own login flow and passes it here. To include the optional Turn package, pass `-IncludeTurn` to the generation script.
+
+## Server Template
+
+The server template (`tools/tiny-server-template/`) is a published .NET 10 bundle containing a Host and a Gateway. Both applications register Tiny State, Frame, and Hybrid — and Tiny Turn by default:
+
+```powershell
+# Start Host
+cd host
+dotnet AbilityKit.Orleans.Host.dll
+
+# Start Gateway (separate terminal)
+cd gateway
+dotnet AbilityKit.Orleans.Gateway.dll
+```
+
+Default ports: Orleans Gateway `30000`, TCP Gateway `4000`, HTTP `5001`. Override with `AbilityKit__Orleans__*`, `AbilityKit__Gateway__Tcp__Port`, and `AbilityKit__Gateway__Http__Port` environment variables. To disable Turn without changing battle rules: `AbilityKit__Tiny__EnableTurn=false`.
+
+The `composition/` directory inside the bundle contains a separately compiled Host project with an explicit `ConfigureGameplay` registration point, so your project can add its own server modules without touching the source checkout.
+
+## Running the Verification Script
+
+The canonical acceptance entry point is `verify-tiny-starter.ps1` from the repository root:
+
+```powershell
+./tools/verify-tiny-starter.ps1
+```
+
+The script executes the following in order:
+
+1. Protocol and dependency layer checks
+2. Room and Tiny replicator tests
+3. Host / Gateway / client builds
+4. Room sample (isolated port)
+5. State, Frame, Hybrid, and Recovery dual-client `.NET` acceptance (each mode starts independent owner and guest processes with different PIDs)
+6. Three-mode comprehensive TCP recovery acceptance
+7. Isolated headless Unity EditMode, PlayMode, and network PlayMode tests (State, Frame, and Hybrid projection and recovery)
+
+Evidence for each run is written to `local/Logs/tiny-acceptance-*/` including `owner.json`, `guest.json`, per-process logs, and `tiny-network-playmode.json`.
+
+To skip the Unity stages (faster, CI-friendly):
+
+```powershell
+./tools/verify-tiny-starter.ps1 -SkipUnity
+```
+
+To focus on a single chapter during development:
+
+```powershell
+./tools/verify-tiny-starter.ps1 -FocusChapter 04
+```
+
+## Key Source Locations
+
+| Path | Contents |
+|---|---|
+| `Unity/Packages/com.abilitykit.demo.tiny.logic/Runtime/Logic` | Deterministic rules — `TinyInput`, `TinyBattle`, `TinyBattleState`, `TinyBattleStateCodec` |
+| `Unity/Packages/com.abilitykit.demo.tiny/Runtime/View/TinyBattleSession.cs` | Room and battle session orchestration |
+| `Unity/Packages/com.abilitykit.demo.tiny/Runtime/View/TinyViewModules.cs` | Unity actor projection — `TinyActorViewModule` |
+| `Unity/Packages/com.abilitykit.demo.tiny/Runtime/FrameSync/TinyFrameSyncSession.cs` | Rollback coordinator adapter |
+| `Unity/Packages/com.abilitykit.demo.tiny/Runtime/View/Sync/TinyFrameReplication.cs` | Frame replication and hash convergence |
+| `src/AbilityKit.Demo.Tiny.StateSample/` | Standalone Room + State dual-client .NET project |
+| `src/AbilityKit.Demo.Tiny.FrameSample/` | Standalone Frame dual-client .NET project |
+| `src/AbilityKit.Demo.Tiny.HybridSample/` | Standalone Hybrid dual-client .NET project |
+| `src/AbilityKit.Demo.Tiny.RecoverySample/` | Four-fault Recovery acceptance project |
+| `src/AbilityKit.Demo.Tiny.Record.Sample/` | Offline record and replay |
+| `src/AbilityKit.Demo.Tiny.LiveRecord.Sample/` | Live Gateway record and checkpoint replay |
+| `src/AbilityKit.Demo.Tiny.ProtocolEvolution.Sample/` | V1/V2 schema compatibility and capability negotiation |
+| `src/AbilityKit.Demo.Tiny.BattleStyles.Sample/` | Local turn vs. real-time Arena comparison |
+| `tools/tiny-consumer-template/` | Generated standalone Unity consumer project |
+| `tools/tiny-server-template/` | Published Host + Gateway server bundle |
+| `tools/verify-tiny-starter.ps1` | Unified acceptance script |
+
+<Note>
+The independent dual-process acceptance tests (owner and guest as separate `.NET` processes connecting to the same Gateway) prove network-layer correctness. They do **not** substitute for full visual client verification — two interactive Unity clients with rendered gameplay scenes and UI interaction still require a separate acceptance pass.
+</Note>

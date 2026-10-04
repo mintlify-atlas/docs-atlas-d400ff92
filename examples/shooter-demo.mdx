@@ -1,0 +1,199 @@
+---
+title: "Shooter Demo: Authoritative State Sync and Network Loop"
+sidebarTitle: "Shooter Demo"
+description: "Study authoritative state sync, client interpolation, prediction, rollback, Svelto ECS, dual-connection room flow, and multi-process smoke-test validation."
+---
+
+The Shooter demo focuses on a different set of concerns than the MOBA demo. Where MOBA demonstrates the breadth of the skill and combat domain, the Shooter demo is AbilityKit's reference for **network synchronization strategy, snapshot encoding, room orchestration, server authority, client recovery, and smoke-test validation**. It runs a deterministic `Svelto`-driven battle simulation on the server and validates that multiple sync strategies — authoritative interpolation, predict/rollback, pure-state delta, and hybrid hero prediction — all converge correctly with a live Orleans Gateway.
+
+<Tip>
+The Shooter demo's pure-state-sync path includes performance analysis tooling (`tools/run_shooter_sync_performance_matrix.ps1`, `tools/run_shooter_sync_allocation_gate.ps1`) and is the best reference for high-entity-count scenarios. The `mass-battle-lod-aoi` template with AOI boundaries of `24/30` units shows how to budget snapshot bandwidth for large entity populations.
+</Tip>
+
+## What the Shooter Demo Demonstrates
+
+The demo covers six independent capability layers that you can study and adapt independently:
+
+- **Authoritative state sync** — the server runs the canonical `ShooterBattleRuntimePort`; clients never own the truth
+- **Client interpolation** — `ShooterClientAuthoritativeInterpolationSyncController` smooths the authoritative frame stream for display
+- **Client prediction and rollback** — `ShooterClientPredictRollbackSyncController` speculatively advances local state and corrects against authority
+- **Svelto ECS deterministic simulation** — `ShooterBattleSimulation` uses `SveltoCompositionRoot` and jobs-based ECS for player movement, aiming, firing, bullet flight, hit detection, and enemy waves
+- **Dual-connection setup** — Room Gateway + independent battle transport, modelled by `ShooterRoomGatewayFlow` and `ShooterRemoteStateSyncConnectionFlow`
+- **Multi-process acceptance testing** — `ShooterSmokeRunner` brings up real server and client processes, submits inputs through the Gateway, and cross-validates runtime hash, presentation frame, stale snapshot handling, late join, reconnect, and full gameplay loop
+
+## Core Sync Capabilities
+
+<Tabs>
+  <Tab title="State Sync">
+    The default server template (`state-sync-authority`) pushes a packed snapshot every frame and a full packed snapshot every 30 frames. The Room declares `AuthoritativeInterpolation` capability; the client factory binds the matching controller automatically.
+
+    `ShooterPackedSnapshotExporter` produces stable-ordered payloads that include:
+    - Lifecycle block (entity presence)
+    - Player and bullet transform blocks
+    - Player and enemy HP blocks
+    - Score block and bullet lifetime block
+    - Frame index and state hash
+    - Full/keyframe marker
+
+    `ShooterPureStateSnapshotExporter` handles the bandwidth-conscious path with full baseline + delta updates, maximum entity budget enforcement, and observer interest management:
+
+    ```text
+    PureState modes: batch (60/300 interval), mass-battle-lod-aoi (90/450 interval)
+    AOI: visible boundary = 24 units, outer boundary = 30 units
+    ```
+
+    `ShooterStateHasher` produces deterministic hashes of player state, bullet state, and the current frame. The smoke runner cross-validates the runtime hash, packed snapshot hash, and the hash after client application.
+  </Tab>
+  <Tab title="Client Prediction">
+    Enabling `predict-rollback-authority` switches the server to push a full packed snapshot every single frame. The client binds `ShooterClientPredictRollbackSyncController`.
+
+    `ShooterClientSyncControllerFactory` maps declared Room capabilities to controller instances:
+
+    | Room Capability | Controller |
+    |---|---|
+    | `PredictRollback` | `ShooterClientPredictRollbackSyncController` |
+    | `AuthoritativeInterpolation` | `ShooterClientAuthoritativeInterpolationSyncController` |
+    | `BatchStateSync` | Batch state sync controller |
+    | `MassBattleLodSync` | Large-scale LOD sync controller |
+    | `HybridHeroPrediction` | `ShooterClientHybridHeroPredictionSyncController` |
+
+    `ShooterFrameworkSnapshotPipeline` is the unified decode and dispatch entry for both packed and pure-state payloads. It registers OpCode routes for `PackedState`, `PackedStateDelta`, `PureState`, and `PureStateDelta`, then applies through `ShooterClientSnapshotApplyCoordinator`:
+
+    1. `ShooterStateSyncCompatibilityPolicy` validates protocol version
+    2. Stale snapshots (not later than `LastAppliedFrame`) are discarded
+    3. `ShooterBattleRuntimePort.ImportPackedSnapshot` applies authoritative state
+    4. Presentation projection is generated for the view layer
+
+    The two pipelines — sync state and presentation state — are intentionally parallel: `ShooterBattleRuntimePort` owns deterministic truth; `ShooterPresentationFacade` owns the visual representation.
+  </Tab>
+  <Tab title="Reconnect Recovery">
+    `ShooterRemoteStateSyncPlayModeHost` drives the full reconnect lifecycle inside Unity's PlayerLoop:
+
+    | Launch Mode | Behaviour |
+    |---|---|
+    | `CreateNew` | Creates a room, readies, starts, and subscribes |
+    | `JoinRoom` | Joins an existing room by ID, readies, starts, and subscribes |
+    | `RestoreFirst` | Attempts to restore an existing session; falls back to `CreateNew` on failure |
+    | `RestoreOnly` | Restores or throws — used for automatic reconnect after socket loss |
+
+    When the underlying socket disconnects (`TryBeginAutoReconnectAfterSocketLoss`), the Host constructs a `RestoreOnly` launch, clears the input queue, disposes the previous launcher, and re-invokes `StartAsync`. Late joiners and reconnecting clients request an initial full-state baseline before entering normal tick.
+
+    `ShooterFastReconnectDriver` handles the rapid reconnect case where the client re-enters an in-progress battle within the reconnect window, restoring snapshot continuity without reloading the full match.
+  </Tab>
+</Tabs>
+
+## Svelto Deterministic Simulation
+
+`ShooterBattleSimulation` divides each tick into two deterministic phases:
+
+```text
+TickPlayers(deltaTime)
+  - Read player input
+  - Update movement
+  - Update aiming
+  - Handle fire requests → spawn bullets
+
+TickBullets(deltaTime)
+  - Advance bullet positions
+  - Decrement lifetime
+  - Detect hits against ShooterSpatialHashGrid
+  - Write hit event snapshots
+  - Remove expired bullets
+```
+
+`ShooterEntityManager` wraps Svelto's `ISveltoWorldContext` and batches structural changes (entity add/remove) for deferred commit, ensuring that the simulation never modifies entity collections mid-iteration.
+
+`ShooterBattleRuntimePort` exposes a single facade over all runtime operations:
+
+```csharp
+// Key interface contracts (implemented by ShooterBattleRuntimePort)
+IShooterGameStartPort       // StartGame()
+IShooterInputPort           // SubmitInput()
+IShooterSimulationClock     // Tick()
+IShooterSnapshotReadPort    // GetSnapshot()
+IShooterStateHashProvider   // ComputeStateHash()
+IShooterPackedSnapshotPort  // ExportPackedSnapshot() / ImportPackedSnapshot()
+IShooterPureStateSnapshotPort // ExportPureStateSnapshot()
+```
+
+External code (Orleans adapters, smoke runners, client sessions) only depends on this facade — never on simulation internals.
+
+## Gateway and Orleans Orchestration
+
+The Shooter demo uses a full Orleans cluster for server-side authority:
+
+```
+ShooterRoomGatewayFlow (client)
+  → GatewayRequestRouter (Orleans Gateway)
+    → RoomGrain (lobby state machine)
+      → ShooterRoomGameplayAdapter (maps room summary to battle init params)
+      → ShooterBattleRuntimeAdapter (battle host ↔ runtime port bridge)
+      → BattleFrameSyncGrain (timer-driven frame collection and push)
+```
+
+`RoomGrain` maintains room membership, the gameplay adapter, the battle ID, and the world start anchor. It advances through: member join → all-ready → `BeginLoading` → all assets loaded → idempotent commit → `InBattle`. A room holds 2 players by default; `ShooterRoomGameplayAdapter.CanStart` requires all current members to be ready before the commit fires.
+
+## Multi-Process Acceptance Testing
+
+`ShooterSmokeRunner` is not just a happy-path check — it validates the entire network lifecycle in a single executable pass:
+
+<Steps>
+  <Step title="Connect and start">
+    Creates a Gateway connection, logs in as a guest, creates a room, readies, starts, and subscribes to state sync.
+  </Step>
+  <Step title="Validate initial state">
+    Waits for the first packed snapshot push, then cross-validates runtime frame, presentation frame, and state hash.
+  </Step>
+  <Step title="Submit inputs and verify">
+    Submits multiple input batches via the Gateway, checking `acceptedFrame`, `currentFrame`, server tick count, and state text after each.
+  </Step>
+  <Step title="Test stale snapshot guard">
+    Injects an artificially old packed snapshot and asserts `IgnoredStaleSnapshot` is returned.
+  </Step>
+  <Step title="Validate projection">
+    Checks player count in the presentation layer and verifies view projection results.
+  </Step>
+  <Step title="Late join and reconnect">
+    Tests late-join projection, then re-logs the account and validates the reconnect projection path.
+  </Step>
+  <Step title="Full gameplay loop">
+    Runs through `IBattleLogicHostGrain` to complete a full game, recording server input/output and snapshot data.
+  </Step>
+  <Step title="Replay validation">
+    Generates an input-logic replay from the recorded data and validates convergence.
+  </Step>
+</Steps>
+
+## Key `tools/` Scripts
+
+The following scripts support the Shooter demo's performance, validation, and CI workflows:
+
+| Script | Purpose |
+|---|---|
+| `Server/Orleans/tools/run_shooter_multiprocess_smoke.ps1` | Multi-process fault matrix — runs recoverable retry, Gateway offline, slow consumer, and periodic disconnect scenarios |
+| `tools/run_shooter_sync_performance_matrix.ps1` | A/B performance matrix across all sync templates with entity-count and bandwidth metrics |
+| `tools/run_shooter_sync_allocation_gate.ps1` | Zero-allocation gate for the steady-state sync pipeline |
+| `tools/run_shooter_unity_headless_multiplayer.ps1` | Headless Unity multiplayer runner for high-entity-count render performance |
+| `Server/Orleans/tools/run_shooter_smoke.ps1` | Standard smoke test entry point |
+
+## Key Source Files
+
+| Module | Source |
+|---|---|
+| Battle world | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Worlds/ShooterBattleWorldBlueprint.cs` |
+| Runtime port | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Application/Runtime/ShooterBattleRuntimePort.cs` |
+| Simulation | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Domain/Battle/ShooterBattleSimulation.cs` |
+| Entity manager | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Application/Services/EntityManager/ShooterEntityManager.cs` |
+| Packed snapshot export | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Application/Synchronization/ShooterPackedSnapshotExporter.cs` |
+| Pure-state snapshot export | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Application/Synchronization/ShooterPureStateSnapshotExporter.cs` |
+| State hasher | `Unity/Packages/com.abilitykit.demo.shooter.runtime/Runtime/Application/Synchronization/ShooterStateHasher.cs` |
+| Client session | `Unity/Packages/com.abilitykit.demo.shooter.view.runtime/Runtime/Client/ShooterClientSession.cs` |
+| Sync controller factory | `Unity/Packages/com.abilitykit.demo.shooter.view.runtime/Runtime/Client/Synchronization/ShooterClientSyncControllerFactory.cs` |
+| Snapshot pipeline | `Unity/Packages/com.abilitykit.demo.shooter.view.runtime/Runtime/Client/Synchronization/ShooterFrameworkSnapshotPipeline.cs` |
+| Unity PlayMode host | `Unity/Packages/com.abilitykit.demo.shooter.view.runtime/Runtime/Unity/PlayMode/ShooterRemoteStateSyncPlayModeHost.cs` |
+| Room flow | `Unity/Packages/com.abilitykit.demo.shooter.view.runtime/Runtime/Client/Gateway/ShooterRoomGatewayFlow.cs` |
+| Smoke runner | `Server/Orleans/src/AbilityKit.Orleans.ShooterSmoke/Runner/ShooterSmokeRunner.cs` |
+
+<Note>
+The Shooter demo's sync controllers, entity layout, AOI/LOD boundaries, room flow, and recovery thresholds are project-level decisions — they are not framework defaults. The mechanisms they use (`SnapshotPipeline`, rollback coordinator, `WorldStateSnapshot`, `HostRuntime`) are public framework API; the strategies are not.
+</Note>

@@ -1,47 +1,217 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Quickstart: Running AbilityKit in Under 15 Minutes"
+sidebarTitle: "Quickstart"
+description: "Set up your environment, run the sample catalog, explore the MOBA Console demo, and open Unity scenes — the fastest path to a working AbilityKit loop."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+AbilityKit is not a single Unity plugin. It is a collection of packages that can run in Unity, pure .NET, a server process, and demo environments — all reusing the same core source. Before diving into a specific capability, the fastest way to build an intuition for the framework is to run some of the built-in samples. This page walks you through the environment requirements, the recommended sample-catalog starting point, the MOBA Console Demo, Unity scene entry points, and the five graduated Starter projects. Follow the steps in order for the smoothest experience.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+## Environment Requirements
 
-## Prerequisites
+Make sure the following are installed before running any build or demo:
 
-Before you begin, you must have:
+| Requirement | Version | Notes |
+|---|---|---|
+| **.NET SDK** | `10.0.300` | Pinned in the root `global.json`. Other SDK versions will be rejected by the SDK resolver. |
+| **Unity** | `2022.3.62f1` | Required for Unity scenes and the Unity Editor. Package baseline is Unity 2022.3. |
+| **OS / Shell** | Windows + PowerShell | The existing build scripts, Unity batchmode commands, and Smoke test scripts have the most coverage on Windows/PowerShell. |
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+<Note>
+  Unity is only required if you intend to work with Unity scenes or packages in the Editor. All core logic and the Console Demo can be built and run with the .NET SDK alone.
+</Note>
 
-## Get started
+## Getting Started
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository and confirm the source layout">
+    Clone the repository to your local machine. The most important structural rule to know before writing any code:
 
-    ```bash
-    npm install your-package
+    > **`Unity/Packages/` is the authoritative source for all shared package runtime code.** Projects in `src/` reference this source directly via `<Compile Include>` entries in their `.csproj` files. Never copy framework source into `src/`.
+
+    ```text
+    AbilityKit/
+    ├── Unity/Packages/      ← framework package source (authoritative)
+    ├── src/                 ← .NET solution: builds, tests, Console Demo
+    ├── Server/Orleans/      ← server-side grains and smoke runners
+    ├── Docs/design/         ← canonical design documentation
+    ├── LubanConfig/         ← config generation inputs
+    └── tools/               ← local dev and validation scripts
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Run the sample catalog (recommended first step — no config or server required)">
+    The repository ships with a tiered sample catalog containing 37 official samples covering 18 categories. These samples run without any Luban configuration, network connection, or server.
+
+    List all available samples:
+
+    ```powershell
+    dotnet run --project src/AbilityKit.Samples -- --list
+    ```
+
+    Run a single sample by its stable ID:
+
+    ```powershell
+    dotnet run --project src/AbilityKit.Samples -- --id onboarding/orientation
+    ```
+
+    Run all 37 samples at once:
+
+    ```powershell
+    dotnet run --project src/AbilityKit.Samples -- --all
+    ```
+
+    Export all samples as a static web page (includes a canvas stage, timeline slider, event cards, and learning panels):
+
+    ```powershell
+    dotnet run --project src/AbilityKit.Samples -- --web sample-web
+    ```
+
+    <Tip>
+      Start with the six `onboarding/*` samples to build your mental model before exploring the more detailed samples in `foundation/*`, `pipeline/*`, `triggering/*`, and `sync/*`.
+    </Tip>
+
+    The recommended progression through the catalog:
+
+    1. **`onboarding/*`** (6 samples) — Build the overall mental model first.
+    2. **`foundation/*`** and **`tags/*`** — Core vocabulary and data entry points.
+    3. **`pipeline/*`**, **`flow/*`**, **`triggering/*`**, **`modifiers/*`** — Behavior orchestration.
+    4. **`world/*`**, **`sync/*`**, **`combat/*`** — Runtime environment and combat pipeline.
+  </Step>
+
+  <Step title="Validate the sample baseline (optional, confirms your environment)">
+    Sample outputs are protected by a golden baseline. Run this script to verify your environment produces exactly the expected output:
+
+    ```powershell
+    powershell -File tools/check_sample_baseline.ps1
+    ```
+
+    If you intentionally change a sample's output, update the baseline:
+
+    ```powershell
+    powershell -File tools/check_sample_baseline.ps1 -Update
+    ```
+
+    This check also runs as part of the `foundation-units` CI gate.
+  </Step>
+
+  <Step title="Build the full .NET solution">
+    Once the sample catalog is working, you can validate that the entire solution compiles:
+
+    ```powershell
+    dotnet build src/AbilityKit.sln
+    ```
+
+    This is a good first-pass verification that the `.NET` projects referencing `Unity/Packages/` source all compile correctly. Individual project builds are faster for day-to-day work.
+  </Step>
+
+  <Step title="Run the MOBA Console Demo">
+    The Console Demo is a fully assembled combat composition root that runs in a pure .NET process — no Unity required. It creates a `ConsoleBattleBootstrapper`, initializes config and the runtime World, enters the battle phase, and then drives a complete battle script through `AutoTestRunner`.
+
+    ```powershell
+    dotnet run --project src/AbilityKit.Demo.Moba.Console/AbilityKit.Demo.Moba.Console.csproj
+    ```
+
+    The demo also supports several CLI modes:
+
+    | Mode | Command Suffix | Purpose |
+    |---|---|---|
+    | Default auto-test | *(none)* | Run `FullBattleScenario`, validate initialization and phase transitions |
+    | Skill test | `-- --skill` | Enable Trace/Debug logging, repeat skill-cast scenarios |
+    | Record | `-- --record` | Enter record mode and write a replay file |
+    | Replay | `-- --replay Records/replay_xxx.akrec` | Replay from a recorded file |
+    | List records | `-- --list` | List existing record files |
+
+    You can also override the synchronization mode via an environment variable:
+
+    ```powershell
+    $env:SYNC_MODE="SnapshotAuthority"
+    dotnet run --project src/AbilityKit.Demo.Moba.Console/AbilityKit.Demo.Moba.Console.csproj
+    ```
+
+    Supported `SYNC_MODE` values: `Lockstep`, `SnapshotAuthority`, `Hybrid`.
+
+    <Warning>
+      The Console Demo uses `BootstrapStrict`, which means any configuration error will terminate the process at the World creation phase rather than silently degrading. If the demo exits immediately, check the config loading log output for a failing constraint.
+    </Warning>
+
+    When the demo starts successfully, watch for three categories of output:
+
+    - **Config loading logs** — `battle_start`, heroes, skills, and TriggerPlan loading status.
+    - **Runtime World initialization logs** — `WorldManager`, `MobaWorldBootstrapModule`, service scans, and input port assembly.
+    - **Phase and auto-test results** — `Prepare → Connect → CreateOrJoinWorld → LoadAssets → InMatch` transitions and per-phase test pass/fail results.
+  </Step>
+
+  <Step title="Run focused tests for specific modules">
+    For learning an individual module, running its tests is often faster and more informative than the full Console Demo. Here are some useful starting points:
+
+    Test the World DI container:
+
+    ```powershell
+    dotnet test src/AbilityKit.World.DI.Tests/AbilityKit.World.DI.Tests.csproj
+    ```
+
+    Test the network runtime (clock, latency compensation, sync health events):
+
+    ```powershell
+    dotnet test src/AbilityKit.Network.Runtime.Tests/AbilityKit.Network.Runtime.Tests.csproj
+    ```
+
+    Test the Shooter runtime (Svelto ECS, state sync, state hash verification):
+
+    ```powershell
+    dotnet test src/AbilityKit.Demo.Shooter.Runtime.Tests/AbilityKit.Demo.Shooter.Runtime.Tests.csproj
     ```
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
-    ```
+  <Step title="Open Unity scenes">
+    If you have Unity `2022.3.62f1` installed, open `Unity/` with Unity Hub to access the playable scenes.
+
+    | Scene | Path | Purpose |
+    |---|---|---|
+    | **StarterScene** | `Unity/Assets/Scenes/StarterScene.unity` | Unified launcher — select a MOBA, Shooter, or Tiny profile and start the corresponding Gameplay Root |
+    | **MOBA Gameplay** | `Unity/Packages/com.abilitykit.demo.moba.view.runtime/Scenes/MobaDemoGameplayScene.unity` | MOBA package's own gameplay scene with full combat presentation |
+    | **Shooter Gameplay** | `Unity/Packages/com.abilitykit.demo.shooter.view.runtime/Scenes/ShooterDemoGameplayScene.unity` | Shooter package's own gameplay scene with state-sync presentation |
+
+    StarterScene's public composition layer only handles profile selection and Gameplay Root instantiation. Multiplayer services, accounts, Room, session, and gameplay teardown are all handled by components inside the selected Root.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Using the Graduated Starter Projects
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+If you want the absolute minimum dependency surface — not a full-capability tour — the repository includes five graduated Starter projects that add packages incrementally. Each project directly references only the packages for its tier and can be run with `dotnet run`.
+
+| Starter Project | Dependencies | Lines of Code |
+|---|---|---|
+| `src/AbilityKit.Samples.Foundation` | `core` + `world.di` only | ~301 lines |
+| `src/AbilityKit.Samples.SkillCore` | Foundation + `triggering` + `pipeline` + `attributes` | Adds skill/trigger/Buff layer |
+| `src/AbilityKit.Samples.BattleRuntime` | SkillCore + `combat.targeting` + `combat.projectile` + `combat.damage` | Adds projectile/damage/targeting |
+| `src/AbilityKit.Samples.SyncRuntime` | BattleRuntime + framesync/snapshot/statesync/record | Adds multiplayer sync and replay |
+| `src/AbilityKit.Samples.ServerRuntime` | SyncRuntime + `host` + `host.extension` + server adapters | Adds server-side hosting |
+
+Each Starter is a self-contained runnable project that demonstrates the minimal viable composition for its tier. They reference each other as "what comes next" and are a clean starting point for understanding how the package layers compose.
+
+## Adopting Packages Into Your Own Project
+
+When integrating AbilityKit into an existing project, do not import the entire repository. Instead, copy the specific `com.abilitykit.*` packages you need from `Unity/Packages/` into your project and check their transitive dependencies.
+
+```text
+Unity/Packages/
+├── com.abilitykit.core/
+├── com.abilitykit.world.di/
+├── com.abilitykit.pipeline/
+├── com.abilitykit.triggering/
+└── ... (copy only the packages you need)
+```
+
+<Warning>
+  The repository has not yet published all packages to a public UPM registry. Adoption today means copying the source directories from `Unity/Packages/`. Do not copy the Demo package directories (e.g., `com.abilitykit.demo.moba.*`) and treat them as required dependencies — they are reference implementations, not stable framework APIs.
+</Warning>
+
+Start with the smallest capability set that covers your current needs and expand later:
+
+| Goal | Starting Packages | Your Project Still Needs to Implement |
+|---|---|---|
+| Skill flow and rules | `core`, `pipeline`, `triggering`, optionally `ability`, `actionschema` | Skill input, config publication, Action services, gameplay lifecycle |
+| Combat atomic capabilities | `combat.targeting`, `combat.damage`, `combat.projectile`, `combat.motion` as needed | Entity storage, World service registration, system ordering, presentation feedback |
+| Logical world and host | `world.di`, your chosen ECS, `host`/`host.extension` | World creation strategy, module composition, Tick and teardown ownership |
+| Multiplayer sync | `world.framesync`/`snapshot`/`statesync`/`record` and needed `network.*` packages | Authority model, Room capabilities, connection recovery, protocol versioning, scene validation |

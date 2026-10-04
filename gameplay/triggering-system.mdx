@@ -1,0 +1,247 @@
+---
+title: "Triggering System: Event-Driven Gameplay Rule Execution"
+sidebarTitle: "Triggering"
+description: "How com.abilitykit.triggering answers 'when an event fires, which rules run and what actions execute' — from EventBus through TriggerRunner to ActionRegistry."
+---
+
+The Triggering system answers a single design question: **when an event occurs, which rules run and what actions execute?** It does not know about Buff stacks, projectile trajectories, or damage formulas. Instead it provides a formal, data-driven execution backbone: subscribe to events, sort multiple triggers by phase/priority/order, evaluate conditions, execute actions, handle interruption, schedule deferred work, and emit lifecycle notifications. Any gameplay module — active skills, passive buffs, projectile hits, area enter/exit, Timeline node callbacks — connects to combat services by routing events through this layer.
+
+## Package
+
+`com.abilitykit.triggering`
+
+## Architecture Overview
+
+```text
+EventBus → TriggerRunner<TCtx>
+              ↓ sorted trigger list (Phase → Priority → Order)
+           ExecCtx<TCtx>
+              ↓ FunctionRegistry (conditions) + ActionRegistry (actions)
+           PlannedTrigger.Evaluate → Execute
+              ↓ ActionCallPlan → ActionSchemaRegistry
+           side effects: Targeting / Projectile / Damage / EffectContainer
+```
+
+<Info>
+Triggering manages **when to execute, whether to execute, and in what order**. The Ability and Combat packages manage what the business meaning of execution is.
+</Info>
+
+## Key Types
+
+<Accordion title="TriggerRunner&lt;TCtx&gt;">
+
+The main runtime orchestrator. Subscribes to `IEventBus`, maintains per-event-key sorted lists of `TriggerRunnerEntry`, and executes them on each dispatch.
+
+```csharp
+// Source: com.abilitykit.triggering
+// Runtime/Triggering/Runner/TriggerRunner.cs
+
+public sealed class TriggerRunner<TCtx>
+{
+    public TriggerRunner(
+        IEventBus eventBus,
+        FunctionRegistry functions,
+        ActionRegistry actions,
+        ITriggerContextSource<TCtx> contextSource = null,
+        ITriggerObserver<TCtx> observer = null,
+        ITriggerLifecycle<TCtx> lifecycle = null,
+        IBlackboardResolver blackboards = null,
+        IPayloadAccessorRegistry payloads = null,
+        IIdNameRegistry idNames = null,
+        INumericVarDomainRegistry numericDomains = null,
+        INumericRpnFunctionRegistry numericFunctions = null,
+        ExecPolicy policy = default,
+        EInterruptPolicy interruptPolicy = EInterruptPolicy.None,
+        ActionSchedulerManager actionSchedulerManager = null,
+        ITriggerTracer<TCtx> tracer = null)
+    { ... }
+
+    public IDisposable Register<TArgs>(
+        EventKey<TArgs> key,
+        ITrigger<TArgs, TCtx> trigger,
+        int phase = 0,
+        int priority = 0)
+    { ... }
+}
+```
+
+</Accordion>
+
+<Accordion title="TriggerRunnerEntry">
+
+Each registered trigger is stored as a `TriggerRunnerEntry`. The runner inserts entries into a sorted list on registration.
+
+```csharp
+// Source: Runtime/Triggering/Runner/TriggerRunnerEntry.cs
+internal readonly struct TriggerRunnerEntry<TArgs, TCtx>
+{
+    public readonly int Phase;
+    public readonly int Priority;
+    public readonly long Order;
+    public readonly ITrigger<TArgs, TCtx> Trigger;
+}
+```
+
+Entries are sorted: **ascending Phase → descending Priority → ascending registration Order**. Phase groups semantically related triggers (e.g., all pre-damage effects run before post-damage effects). Priority within a phase resolves conflicts. Order provides stable tie-breaking by insertion sequence.
+
+</Accordion>
+
+<Accordion title="ExecCtx and ExecutionControl">
+
+`ExecCtx<TCtx>` is the extension-point aggregate object created fresh for every event dispatch. It bundles the context source, function registry, action registry, blackboard resolver, payload accessor registry, numeric domains, and execution control into a single pass-through object.
+
+`ExecutionControl` extracts `StopPropagation` and `Cancel` semantics from individual actions, preventing action code from directly manipulating runner internals. After a hard stop, the runner skips remaining trigger entries for that event.
+
+</Accordion>
+
+<Accordion title="TriggerPlan&lt;TArgs&gt; — Data Model">
+
+`TriggerPlan<TArgs>` is the immutable plan model. All plans are data, not logic containers.
+
+```csharp
+// Source: Runtime/Plans/Model/TriggerPlan.cs
+// Key fields:
+//   Phase, Priority, TriggerId
+//   InterruptPriority
+//   PredicateKind / HasPredicate / PredicateId / PredicateExpr
+//   Actions (ActionArgValue[])
+//   Cue  (ITriggerCue)
+//   Schedule (scheduling mode)
+//   ExecutionControl
+```
+
+Three constructor overloads cover: no-condition triggers, function-condition triggers, and expression-tree-condition triggers.
+
+</Accordion>
+
+<Accordion title="FunctionRegistry and ActionRegistry">
+
+```csharp
+// Source: Runtime/Registries/FunctionRegistry.cs
+// Source: Runtime/Registries/ActionRegistry.cs
+```
+
+Both carry `IsDeterministic` markers. Deterministic registration is a prerequisite for frame-sync replay and determinism validation.
+
+</Accordion>
+
+<Accordion title="ActionSchedulerManager">
+
+Manages deferred actions and plan-internal scheduled calls. Attached to the runner's runtime services so deferred work is dispatched on each event cycle rather than scattered across action implementations.
+
+</Accordion>
+
+## TriggerRunnerEntry Field Reference
+
+<ParamField path="Phase" type="int">
+  Execution phase group. Lower values run first. Use phases to express before/after semantics (e.g., Phase 0 = pre-effects, Phase 10 = post-effects). Triggers in Phase 0 all complete before Phase 10 begins.
+</ParamField>
+
+<ParamField path="Priority" type="int">
+  Within a phase, higher priority values run first. Use to control conflict resolution between triggers that share a phase.
+</ParamField>
+
+<ParamField path="Order" type="long">
+  Monotonically increasing registration sequence number. Acts as a stable tiebreaker when Phase and Priority are equal. Assigned automatically by `TriggerRunner.Register`.
+</ParamField>
+
+<ParamField path="Trigger" type="ITrigger<TArgs, TCtx>">
+  The trigger implementation that owns `Evaluate(args, ctx)` and `Execute(args, ctx)`. May be a data-driven `TriggerPlan` or a hand-written C# trigger.
+</ParamField>
+
+## Event Dispatch Flow
+
+<Steps>
+  <Step title="Publish">
+    Game logic calls `IEventBus.Publish(EventKey&lt;TArgs&gt;, args)`. The runner's internal dispatcher receives the call.
+  </Step>
+  <Step title="Create ExecCtx">
+    A fresh `ExecCtx<TCtx>` and `ExecutionControl` are constructed for this dispatch.
+  </Step>
+  <Step title="Iterate sorted entries">
+    The runner walks entries for that event key in Phase → Priority → Order order. `ExecutionControl.ShouldBlock` is checked first; blocked entries emit a short-circuit Cue and are skipped.
+  </Step>
+  <Step title="Evaluate conditions">
+    For each entry, `ITrigger.Evaluate(args, execCtx)` runs the predicate (function, expression, or none). Failures notify `ITriggerLifecycle.OnConditionFailed` and optionally apply `EInterruptPolicy.Strict` to cancel remaining entries.
+  </Step>
+  <Step title="Execute actions">
+    On success, `ITrigger.Execute(args, execCtx)` resolves actions from `ActionRegistry` and dispatches them in order. Actions may call Targeting, Projectile, Damage, or EffectContainer services.
+  </Step>
+  <Step title="Hard stop check">
+    After each entry, if `ExecutionControl.IsHardStopped`, the runner emits a ShortCircuit Cue (`Cancel` or `StopPropagation`) and terminates remaining entries.
+  </Step>
+  <Step title="Post-dispatch">
+    `ITriggerLifecycle.OnEventDispatched` fires. The `ActionSchedulerManager` processes any deferred actions enqueued during execution.
+  </Step>
+</Steps>
+
+## C# Usage Example
+
+The following example registers a trigger that fires when a custom `HeroHitEvent` is published, and conditionally applies an effect:
+
+```csharp
+// Define an event key for your domain event
+// EventKey<TArgs> is parameterized on the payload type
+var hitEventKey = new EventKey<HeroHitEventArgs>("Hero.Hit");
+
+// Build a trigger that runs when HP drops below 30%
+var trigger = new LambdaTrigger<HeroHitEventArgs, IWorldResolver>(
+    evaluate: (args, ctx) => args.TargetHpRatio < 0.3f,
+    execute:  (args, ctx) => ctx.Context.EffectService
+                                 .Apply(criticalWoundSpec, ctx.Context));
+
+// Register at phase 0, priority 10
+var handle = triggerRunner.Register(hitEventKey, trigger, phase: 0, priority: 10);
+
+// Publish the event from game logic
+eventBus.Publish(hitEventKey, new HeroHitEventArgs { TargetHpRatio = 0.25f });
+
+// Dispose the handle to unregister
+handle.Dispose();
+```
+
+<Warning>
+`TriggerRunner.Register` adds the entry to the live list **before** calling `lifecycle.OnRegistered`. If the lifecycle callback throws, the entry is already in the list and no rollback occurs. Unregistration reverses the order. Wrap registration and unregistration in project-level compensation boundaries.
+</Warning>
+
+## Two TriggerContext Types
+
+AbilityKit uses two distinct context compositions in the MOBA demo, which illustrates the intended separation:
+
+| Context | Layer | Use Case |
+|---------|-------|----------|
+| `TriggerRunner<IWorldResolver>` | Runtime (framework) | Event-subscribed passive skills, Buff ongoing plans, area triggers |
+| `ExecCtx<SkillPipelineContext>` | Ability layer (project) | Skill RulePlan phase execution — synchronous, gate-style |
+
+The runtime layer context drives reactive, subscription-based triggers. The ability-layer context drives synchronous rule validation inside skill Pipeline phases (via `MobaTriggerPlanExecutor.ExecuteRulePlan`). Do not conflate the two.
+
+## Persistent Trigger Plans
+
+Long-lived behaviors such as passives, auras, and area effects are not silently attached to objects. Instead, they are stored explicitly in `OngoingTriggerPlansComponent` and reconciled by `MobaOngoingTriggerPlansReconcileSystem` each world tick. This means:
+
+- Plan additions and removals are tracked by `Revision` for change detection.
+- Subscription setup and teardown are deterministic and centralized.
+- Cancellation and cleanup are handled by a single reconciliation pass.
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Active and Passive Skills" icon="wand-magic-sparkles">
+    Passive skills subscribe a `TriggerPlan` on the ongoing plans component. Active skills invoke `ExecuteRulePlan` synchronously from a Pipeline phase.
+  </Card>
+  <Card title="Buff Tick Events" icon="timer">
+    Buff intervals publish typed events on `EventBus`. Subscriber triggers react to apply periodic damage, healing, or status changes.
+  </Card>
+  <Card title="Projectile Hit Events" icon="crosshairs">
+    `ProjectileWorld` emits `ProjectileHitEvent`; a subscribed trigger resolves the target, invokes damage calculation, and applies secondary effects.
+  </Card>
+  <Card title="Area Enter / Exit" icon="circle-dot">
+    Area systems publish enter/exit events. Trigger plans bound to those event keys activate or deactivate buffs on the entities involved.
+  </Card>
+  <Card title="Timeline Node Actions" icon="film">
+    At configured millisecond offsets, a `SkillTimelinePhase` fires named events. Trigger plans registered to those keys execute at the exact frame-accurate moment.
+  </Card>
+  <Card title="Deterministic Replay" icon="rotate">
+    `FunctionRegistry` and `ActionRegistry` entries carry `IsDeterministic` flags. The replay system validates that all logic in a recorded session used only deterministic registrations.
+  </Card>
+</CardGroup>

@@ -1,0 +1,158 @@
+---
+title: "Console Demo: Run the Full MOBA Combat Loop in .NET"
+sidebarTitle: "Console Demo"
+description: "Run a full MOBA-style combat loop in a pure .NET process, validating World, Host, sync adapters, combat runtime, and presentation projection without Unity."
+---
+
+The Console Demo is AbilityKit's reference integration shell for pure .NET environments. Rather than being a simplified toy, it assembles configurations, a runtime world, phase flow, Features, input, sync adapters, presentation events, automated tests, and replay support into a single executable — proving that the full combat stack runs independently of any graphics context. Teams use it to validate the World, Host, sync adapters, combat runtime, and presentation projection pipeline on CI without requiring Unity Editor.
+
+## Running the Demo
+
+Start the Console Demo from the repository root with a single `dotnet run` invocation:
+
+```bash
+dotnet run --project src/AbilityKit.Demo.Moba.Console/AbilityKit.Demo.Moba.Console.csproj
+```
+
+The process resolves CLI flags, constructs the `ConsoleBattleBootstrapper`, and enters the selected run mode. No Unity installation or license is required.
+
+<Note>
+The Console Demo's `FrameSyncAdapter`, `StateSyncAdapter`, and `HybridSyncAdapter` are experimental implementations that live entirely inside the demo project. They are **not** the public API of `com.abilitykit.coordinator` — do not treat them as the framework's coordination contract or copy them into production code.
+</Note>
+
+## Bootstrap Chain
+
+The `ConsoleBattleBootstrapper` is the composition root. Calling `Initialize()` → `Start()` → `SetupBattle()` brings the process from startup to an active in-match state:
+
+```
+Program.Main
+  └── ConsoleBattleBootstrapper
+        ├── BattleStartConfig → BattleStartPlan + MobaBattleLaunchSpec
+        ├── BattleFlow (Idle → Prepare → Connect → CreateOrJoinWorld → LoadAssets → InMatch → End)
+        ├── FeatureHost (manages Feature attach / tick / detach)
+        ├── WorldManager + MobaWorldBootstrapModule → MOBA Runtime World
+        └── IBattleSyncAdapter (selected by SyncAdapterFactory)
+```
+
+`SetupBattle()` advances the phase flow directly to `InMatch`, which triggers `InMatchPhase` to attach all registered Features, spawn character entities, register the local player, and signal battle start.
+
+## The Four Core Features
+
+`InMatchPhase` mounts these Features via `FeatureHost` on every battle entry:
+
+<CardGroup cols={2}>
+  <Card title="ConsoleInputFeature" icon="keyboard">
+    Reads the HUD state written by the background `ConsoleInputHandler` thread each frame, encodes it as a `PlayerInputCommand`, and submits it to `IWorldInputSink` via `HostNetworkInputSink`.
+  </Card>
+  <Card title="ConsoleSyncFeature" icon="arrows-rotate">
+    Implements the `IFrameSyncController` contract for the Console host, emits per-frame sync diagnostics, and mirrors the current adapter state for debugging.
+  </Card>
+  <Card title="BattleEntityFeature" icon="cubes">
+    Creates the Console-local ECS world and injects `BattleEntityFactory`, `BattleEntityQuery`, and `BattleEntityLookup` into the battle context. Must be attached first because `SpawnCharacter` depends on its factory.
+  </Card>
+  <Card title="ConsoleViewFeature" icon="display">
+    Drives the `IConsoleBattleView` lifecycle during `InMatch`. Works alongside `ConsoleBattleViewEventSink`, which translates Share-layer snapshot events (actor spawn, transform, damage, projectile, presentation cue) into console renderer calls.
+  </Card>
+</CardGroup>
+
+## Sync Adapter Options
+
+`SyncAdapterFactory` selects an adapter based on `BattleStartConfig.SyncMode`:
+
+| `SyncMode` | Adapter | Behaviour |
+|---|---|---|
+| `Lockstep` | `FrameSyncAdapter` | Mirrors `ConsoleBattleContext.LastFrame` and `LogicTimeSeconds`; fires `OnFrameSync` each tick |
+| `SnapshotAuthority` | `StateSyncAdapter` | Snapshot-authority path for state-sync validation scenarios |
+| `Hybrid` | `HybridSyncAdapter` | Mixed prediction/correction mode for hybrid sync experiments |
+
+The adapter does **not** advance the frame counter. Frame advancement happens in `ConsoleBattleBootstrapper.Tick()`, which increments `LastFrame` and `LogicTimeSeconds` before calling the adapter.
+
+## Per-Frame Tick Order
+
+Each call to `ConsoleBattleBootstrapper.Tick(deltaTime)` executes in the following order:
+
+```
+1. Update total time and LastFrame
+2. BattleFlow.Tick  →  InMatch FeatureHost.Tick
+3. RuntimeWorld.Tick
+4. PresentationCuePresenter.Tick
+5. ConsoleBattleView.Tick
+6. IBattleSyncAdapter.Tick
+7. ConsoleViewTimelineRuntime.SeekAllToCurrentFrame
+8. ConsoleViewBinder.SyncActor + TickRender
+9. (Optional) Snapshot recording
+```
+
+## Input Pipeline
+
+Input is split across two stages to keep the keyboard thread out of the game loop:
+
+```
+ConsoleInputHandler (background thread)
+  └── Writes HUD state: HudMoveDx, HudMoveDz, HudSkillClickSlot
+
+ConsoleInputFeature.Tick() (game frame)
+  └── Reads HUD state
+  └── Encodes PlayerInputCommand (MobaMoveCodec / ConsoleSkillInputCodec)
+  └── IWorldInputSink.Submit(frameIndex, commands[])
+        └── HostNetworkInputSink → InProcessHostNetwork → HostRuntime
+```
+
+Move input uses a compact JSON payload; skill input uses shared binary encoding via `BinaryObjectCodec`.
+
+## CLI Run Modes
+
+`Program.Main` supports four modes via command-line arguments:
+
+| Flag | Behaviour |
+|---|---|
+| `--test` / `-t` | Runs `AutoTestRunner` — scripted ticks and state assertions, suitable for CI |
+| `--record` / `-r` | Records inputs and periodic snapshots to a file |
+| `--replay` / `--play` / `-p` | Loads a recording and plays it back |
+| `--skill` | Enters skill-test mode for targeted skill validation |
+
+The default (no flags) starts interactive mode with keyboard input.
+
+## What to Copy vs. What to Leave Behind
+
+<Tabs>
+  <Tab title="Copy These Patterns">
+    - The phase-flow model (`BattleFlow` → `InMatchPhase` → `FeatureHost`) for managing battle lifecycle
+    - Using `BattleStartConfig` to produce both a `BattleStartPlan` (for the host shell) and a `MobaBattleLaunchSpec` (for the runtime world)
+    - Separating the input thread from the input submission step
+    - Routing presentation events through `IBattleViewEventSink` so views are platform-independent
+    - Using `ConsoleBattleBootstrapper` as the entry point for automated tests
+  </Tab>
+  <Tab title="Leave These Behind">
+    - `FrameSyncAdapter`, `StateSyncAdapter`, `HybridSyncAdapter` — demo-local implementations, not framework API
+    - `ConsoleHudFeature` and `ConsoleBattleView` — console-specific presentation
+    - The local ECS world created by `BattleEntityFeature` — this is a demo convenience for spawning display entities
+    - `BattleFlow` phase names and transition logic — your game's phase requirements will differ
+    - The `InProcessHostNetwork` setup — production deployments use a real network transport
+  </Tab>
+</Tabs>
+
+## Key Source Files
+
+<Accordion title="Source file reference">
+
+| File | Purpose |
+|---|---|
+| `src/AbilityKit.Demo.Moba.Console/Program.cs` | CLI entry point — parses run mode, constructs bootstrapper |
+| `src/AbilityKit.Demo.Moba.Console/Bootstrap/ConsoleBattleBootstrapper.cs` | Composition root — assembles all platform objects, Features, sync adapter, runtime world |
+| `src/AbilityKit.Demo.Moba.Console/Battle/Config/BattleStartConfig.cs` | Converts CLI config into `BattleStartPlan` and `MobaBattleLaunchSpec` |
+| `src/AbilityKit.Demo.Moba.Console/Battle/Flow/BattleFlow.cs` | Phase flow — registers all seven phases |
+| `src/AbilityKit.Demo.Moba.Console/Battle/Flow/Phases/InMatchPhase.cs` | In-match phase — attaches Features, spawns characters, triggers battle start |
+| `src/AbilityKit.Demo.Moba.Console/Battle/Features/Context/BattleEntityFeature.cs` | Console-local ECS world and entity factory/query injection |
+| `src/AbilityKit.Demo.Moba.Console/Battle/Input/ConsoleInputFeature.cs` | Per-frame input encoding and submission |
+| `src/AbilityKit.Demo.Moba.Console/Bootstrap/HostNetworkInputSink.cs` | Routes input through the formal Host request/response channel |
+| `src/AbilityKit.Demo.Moba.Console/Battle/Sync/FrameSyncAdapter.cs` | Demo-local Lockstep sync adapter |
+| `src/AbilityKit.Demo.Moba.Console/View/ConsoleBattleView.cs` | Text-mode rendering of entities, HP bars, projectiles, areas, floating numbers |
+| `src/AbilityKit.Demo.Moba.Console/View/ConsoleBattleViewEventSink.cs` | Translates Share-layer view events into console renderer calls |
+| `src/AbilityKit.Demo.Moba.Console/AutoTest/AutoTestRunner.cs` | Scripted test runner for CI and local regression |
+
+</Accordion>
+
+<Warning>
+`Program.Main`'s `finally` block only calls `_bootstrapper.Stop()`, which halts the main loop but does **not** release all resources. Full cleanup (`Host`, `WorldManager`, `SnapshotDispatcher`, `SyncAdapter`, `View`) requires an explicit `Dispose()` call. Tests use `using` blocks to ensure this — interactive exit does not.
+</Warning>

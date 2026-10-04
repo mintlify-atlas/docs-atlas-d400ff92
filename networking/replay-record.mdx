@@ -1,0 +1,151 @@
+---
+title: "Record and Replay System for AbilityKit Multiplayer Games"
+sidebarTitle: "Record & Replay"
+description: "RecordContainer, EventTrack, FrameRecordSink, BasicReplayController — AbilityKit's three-layer record system for replay, regression, and hash auditing."
+---
+
+The record and replay system in AbilityKit captures inputs, state hashes, and snapshots as a battle progresses, then plays them back in a controllable, frame-addressed sequence. This enables four distinct workflows: bug reproduction from a specific game session, determinism verification by comparing state hashes on replay, automated regression by pinning a bug scenario as a test fixture, and interactive debugging with pause, seek, and variable playback speed. The record system is decoupled from both frame sync and state sync — it can attach to either mode without modification.
+
+## Relevant Package
+
+**`com.abilitykit.record`** — `RecordContainer`, `RecordSession`, `EventTrack`, `FrameRecordFile`, `FrameRecordSink`, `FrameRecordReplaySource`, `BasicReplayController`, `FixedStepReplayClock`
+
+## Three-Layer Architecture
+
+AbilityKit's record system is not a single file format. It is three complementary layers with different trade-offs:
+
+| Layer | Core Types | Best For |
+|---|---|---|
+| **Generic Record** | `RecordContainer`, `RecordSession`, `EventTrack`, `BasicReplayController` | Tooling, debugging, multi-track structured history with JSON persistence |
+| **FrameRecord** | `FrameRecordFile`, `FrameRecordSink`, `FrameRecordReplaySource` | Sync diagnostics: direct per-frame query of inputs, hashes, and snapshots |
+| **Console `.akrec`** | `RecordFileHeader`, `ConsoleRecordWriter`, `ConsoleReplayDriver` | MOBA Console demo: fast binary record/play without a custom format |
+
+<Warning>
+These three layers use different file formats and are not interchangeable. The Console `.akrec` format (`AKRC` magic, MemoryPack-serialized commands and snapshots) is not the same as a serialized `RecordContainer` or `FrameRecordFile`. Always document which format a tool or test fixture produces and consumes.
+</Warning>
+
+## `RecordContainer` and `EventTrack`
+
+`RecordContainer` is the master container for the generic record layer. It holds two things: a `Meta` dictionary (string-keyed arbitrary metadata) and a `Tracks` dictionary mapping `RecordTrackId` to `RecordTrack`. It does not mandate how inputs or snapshots are stored — that is decided by the combination of track type, event payload, and codec.
+
+`RecordContainerBuilder` creates default tracks according to a `RecordProfile`:
+
+| `RecordProfile` Field | Meaning |
+|---|---|
+| `EnableInputs` | Create the `inputs` track |
+| `EnableStateHash` | Create the `state_hash` track |
+| `StateHashIntervalFrames` | Sample interval for state hashes |
+| `EnableSnapshots` | Create the `snapshots` track |
+| `IndexChunkFrames` | Chunk granularity for the seek index |
+
+`EventTrack` stores events by frame. Multiple events can exist at the same frame index (e.g., two players issuing commands on the same frame). `EventTrack.Append(event)` adds a `RecordEvent` containing a `FrameIndex`, a `RecordEventType` discriminator, and a raw `byte[]` payload. The codec that interprets the payload is registered separately, which means adding a new event type only requires a new `TypedReplayEventHandler` mapping — not a schema change.
+
+## `FrameRecordSink`: Write-Side for Input Recording
+
+`FrameRecordSink` is the write-side interface for the `FrameRecordFile` layer. The runtime calls it once per frame for each type of data it produces:
+
+```csharp
+// Record an input at frame 100
+sink.AppendInput(frame: new FrameIndex(100), playerId: "p1", opCode: 3, payload: inputBytes);
+
+// Record a state hash at frame 100
+sink.AppendStateHash(frame: new FrameIndex(100), version: 1, hash: 0xDEADBEEF);
+
+// Record a snapshot at frame 100
+sink.AppendSnapshot(frame: new FrameIndex(100), opCode: 0, payload: snapshotBytes);
+```
+
+After the session ends, serialize the `FrameRecordFile` using `FrameRecordOptimizedBinaryCodec` (writer produces v4; reader supports v1–v4) or `FrameRecordJsonCodec` for human-readable debugging output.
+
+## `BasicReplayController`: Tick-Based Event Delivery
+
+`BasicReplayController` drives playback by advancing a `FixedStepReplayClock` each tick and delivering events for each consumed frame to an `IReplayEventHandler`. The constructor requires all three dependencies:
+
+```csharp
+public BasicReplayController(
+    IReplayClock clock,
+    IEventTrackReader reader,
+    IReplayEventHandler handler)
+```
+
+Calling `Tick(deltaTime)` advances the replay:
+
+```csharp
+public void Tick(float deltaTime)
+{
+    if (!_isPlaying) return;
+
+    while (_clock.TryConsume(deltaTime, out var nextFrame))
+    {
+        if (_reader.TryGetEvents(nextFrame, out var evts) && evts != null)
+        {
+            for (int i = 0; i < evts.Count; i++)
+            {
+                var e = evts[i];
+                _handler.Handle(in e);
+            }
+        }
+
+        deltaTime = 0f;
+    }
+}
+```
+
+Setting `deltaTime = 0f` after the first frame consumed in a single `Tick` call prevents the controller from consuming more than one logical advancement per external update, avoiding over-consumption of a large accumulated delta.
+
+`FixedStepReplayClock` accumulates `deltaTime * Speed` and emits one frame per `fixedDelta` interval. This allows variable-speed playback (e.g., `Speed = 2.0f` for double speed) without changing the underlying frame cadence.
+
+## Replay Tick Sequence
+
+<Steps>
+  <Step title="Tick called">
+    The runtime loop (Unity `Update`, Console loop, or test driver) calls `controller.Tick(deltaTime)` with the elapsed wall-clock time since the previous call.
+  </Step>
+  <Step title="Clock check">
+    `FixedStepReplayClock.TryConsume(deltaTime, out nextFrame)` accumulates time. If `_acc >= _fixedDelta`, it increments `_frame`, emits `nextFrame`, and returns `true`.
+  </Step>
+  <Step title="Read events">
+    `IEventTrackReader.TryGetEvents(nextFrame, out events)` returns all `RecordEvent` objects stored at that frame. There may be zero, one, or many events per frame.
+  </Step>
+  <Step title="Dispatch events">
+    Each event is passed to `IReplayEventHandler.Handle(in event)`. `TypedReplayEventHandler` decodes the payload bytes and routes to typed callbacks: `OnInputCommand`, `OnStateHash`, `OnSnapshot`, or `OnDelta`.
+  </Step>
+  <Step title="Reset delta">
+    `deltaTime` is set to `0f` so the inner `while` loop does not double-count the same elapsed time, then loops back to the clock check.
+  </Step>
+</Steps>
+
+## Record System Use Cases
+
+<Accordion title="Bug reproduction">
+Attach `FrameRecordSink` to a session. When a bug is reported, load the `.akfrec` or JSON file and run `FrameRecordReplaySource.TryGetInputs(frame, out inputs)` to replay the exact sequence that caused the issue. The state hash track shows at which frame the divergence first appeared.
+</Accordion>
+
+<Accordion title="Determinism verification">
+Record a session with state hashes enabled (`RecordProfile.EnableStateHash = true`). Replay the input track on a second machine or after a code change. Compare the replayed state hashes against the recorded hashes frame-by-frame. Any divergence identifies the frame and code path that broke determinism.
+</Accordion>
+
+<Accordion title="Automated regression">
+The Console demo's `.akrec` workflow (`ConsoleRecordWriter` → `.akrec` file → `ConsoleReplayDriver`) supports CI-friendly automated replay. The smoke test harness loads the file, replays inputs, compares state hashes, and asserts no divergence. This is the pattern used by the MOBA Console demo for gate-level validation.
+</Accordion>
+
+<Accordion title="State hash audit">
+`FrameRecordReplaySource.TryGetStateHash(frame, out hash, out version)` lets diagnostic tooling cross-reference the recorded hash against a hash computed from a checkpoint snapshot at any arbitrary frame. This is the recommended first step when debugging a reported desync.
+</Accordion>
+
+## Relationship to Frame Sync and State Sync
+
+The record system is independent of both sync modes. It attaches by observing events rather than owning the simulation:
+
+- In **frame sync** mode: `FrameRecordSink.AppendInput` is called from the `IFrameSyncDriverEvents.InputsFlushed` callback, and state hashes are collected in `PostTick`.
+- In **state sync** mode: `FrameRecordSink.AppendSnapshot` is called when the client receives an authoritative snapshot; `AppendStateHash` is called after each local prediction hash is computed.
+- The **Console `.akrec`** format uses `ReplayController.RecordCommand` and `AddSnapshot` independently of the generic `RecordSession` — it is the MOBA Console's own file format, not a serialized `RecordContainer`.
+
+## What Projects Must Provide
+
+| Responsibility | Project Owns |
+|---|---|
+| **File format and versioning** | Choose between JSON (human-readable), optimized binary (v4, varint-packed), or `.akrec` (Console MemoryPack). Maintain version constants and migration strategies. |
+| **Compression** | `MemoryPackSnapshotPacker` performs GZip on payloads over 128 bytes when enabled. For large-scale archiving, integrate compression at the codec level. |
+| **Deep-copy strategy** | Record writers accumulate data in memory and flush on `Dispose`. Ensure command/snapshot objects remain immutable after being appended. No atomic write or temp-file strategy is currently implemented; a crashed process may leave an incomplete file. |
+| **Persistence** | `RecordSession.Serialize()` and `TryLoad(byte[])` handle serialization, but the project decides where files are written and how they are named and retrieved. |

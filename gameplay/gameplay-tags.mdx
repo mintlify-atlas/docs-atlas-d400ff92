@@ -1,0 +1,179 @@
+---
+title: "Gameplay Tags: Hierarchical State Identifiers for Combat"
+sidebarTitle: "Gameplay Tags"
+description: "How com.abilitykit.gameplaytags provides dot-separated hierarchical tags, container/query/stack APIs, and owner-scoped reference-counted state for combat rule evaluation."
+---
+
+Gameplay Tags are hierarchical, dot-separated string identifiers that represent boolean state facts about entities — `State.Control.Stunned`, `Combat.Buff.Shield`, `Immune.CrowdControl`. Unlike flat boolean flags, tags form a tree: any code that queries `HasTag("State.Control")` will match an entity that holds `State.Control.Stunned`, because the child satisfies the parent. This makes tags a powerful tool for expressing broad categories (all control effects) and precise states (only stun, not root) with the same data structure. The `com.abilitykit.gameplaytags` package provides the tag registry, container, query, requirements, and stack APIs. The `com.abilitykit.ability` package adds per-owner reference-counted state on top.
+
+## Package
+
+`com.abilitykit.gameplaytags`
+
+## Core Types at a Glance
+
+| Type | Role |
+|------|------|
+| `GameplayTagManager` | Process-level singleton; registers names, assigns IDs, builds the hierarchy |
+| `GameplayTag` | Immutable value struct holding a process-internal `int Id` and `ushort NetIndex` |
+| `GameplayTagContainer` | `HashSet`-backed explicit tag collection; hierarchical query on read |
+| `GameplayTagRequirements` | Required-All / Blocked-Any gate — the primary gate used in effect application |
+| `GameplayTagQuery` | Expression tree (Include, Exclude, And, Or, Not) for richer conditions |
+| `GameplayTagStackContainer` | Tag → positive-integer count map for tracking stack depth |
+| `GameplayTagTemplate` | Describes grant/remove/prerequisite tag sets; resolved per-owner by `ITagTemplateRegistry` |
+| `IGameplayTagService` | Per-owner reference-counted tag state with source tracking |
+| `TagEffectRouter` | Publishes `GameplayTagDelta` events when owner tag state changes |
+
+## Hierarchy Model
+
+When you request `GameplayTagManager.RequestTag("State.Control.Stunned")`, the manager ensures all parent nodes exist:
+
+```text
+State
+State.Control
+State.Control.Stunned
+```
+
+Registering a child automatically creates missing ancestors. Hierarchy matching flows **upward from child to parent**: a container holding `State.Control.Stunned` satisfies `HasTag("State.Control")`, but a container holding only `State.Control` does **not** satisfy `HasTag("State.Control.Stunned")`.
+
+```csharp
+// Source: com.abilitykit.gameplaytags
+// Runtime/GameplayTags/Core/GameplayTagManager.cs
+
+var manager = GameplayTagManager.Instance;
+
+// Register tags at world startup — never during gameplay tick
+var stunTag  = manager.RequestTag("State.Control.Stunned");
+var rootTag  = manager.RequestTag("State.Control");
+var immuneTag = manager.RequestTag("Immune.CrowdControl");
+```
+
+## Creating Tags, Containers, and Queries
+
+```csharp
+// GameplayTag is a value struct — fast equality and hash by int Id
+var stun  = GameplayTagManager.Instance.RequestTag("State.Control.Stunned");
+var slow  = GameplayTagManager.Instance.RequestTag("State.Control.Slowed");
+var buff  = GameplayTagManager.Instance.RequestTag("Combat.Buff");
+
+// GameplayTagContainer — create fresh instances, never mutate GameplayTagContainer.Empty
+var container = new GameplayTagContainer();
+container.Add(stun);
+container.Add(buff);
+
+// Hierarchical query: child tag satisfies parent query
+bool hasAnyControl = container.HasTag(
+    GameplayTagManager.Instance.RequestTag("State.Control")); // true — stun is a child
+
+// Exact query: only matches the precise tag
+bool hasExactControl = container.HasTagExact(
+    GameplayTagManager.Instance.RequestTag("State.Control")); // false — only stun is present
+
+// Requirements: Required-All AND Blocked-Any
+var requirements = new GameplayTagRequirements();
+requirements.RequireTags.Add(buff);          // must have Combat.Buff
+requirements.BlockedTags.Add(immuneTag);     // must NOT have Immune.CrowdControl
+
+bool canApply = requirements.RequirementsMet(container); // true if buff present and immune absent
+```
+
+## Stack Container
+
+`GameplayTagStackContainer` maps tags to integer counts. Use it when multiple sources can independently grant the same tag and the last source must remove it.
+
+```csharp
+var stack = new GameplayTagStackContainer();
+stack.AddStack(stunTag, sourceA);  // count = 1
+stack.AddStack(stunTag, sourceB);  // count = 2
+
+bool stunned = stack.HasTag(stunTag); // true — count > 0
+
+stack.RemoveStack(stunTag, sourceA); // count = 1 — still stunned
+stack.RemoveStack(stunTag, sourceB); // count = 0 — no longer stunned
+```
+
+<Note>
+`GameplayTagStackContainer.HasTag` uses **exact** matching — it does not walk the hierarchy. It is appropriate for reference-counted state, not for hierarchical queries. Use `GameplayTagContainer.HasTag` when you need hierarchical matching.
+</Note>
+
+## Owner State via IGameplayTagService
+
+The Ability package adds per-owner reference counting on top of the tag container. `IGameplayTagService` (implemented by `GameplayTagService`) stores:
+
+- A `GameplayTagContainer` of currently active tags for each owner.
+- A `TagId → SourceId → Count` reference table.
+
+The container transitions from absent to present only on the first reference from any source, and from present to absent only when the last reference is removed.
+
+```csharp
+// Source: com.abilitykit.ability
+// Runtime/Ability/Tags/GameplayTagService.cs
+
+// Add a tag from a specific source (e.g., a buff instance ID)
+tagService.AddTag(ownerId, stunTag, sourceId: buffInstanceId);
+
+// Query — hierarchical
+bool isControlled = tagService.GetTags(ownerId)
+                               .HasTag(controlRootTag);
+
+// Remove — only withdraws this source's reference; other sources keep the tag alive
+tagService.RemoveTag(ownerId, stunTag, sourceId: buffInstanceId);
+```
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Effect ApplicationRequirements" icon="lock">
+    `GameplayEffectSpec.ApplicationRequirements` checks the target's tag container before Apply. A stun effect blocked by `Immune.CrowdControl` simply fails at the gate — no instance is created, no Trigger event fires.
+  </Card>
+  <Card title="Buff State Organisation" icon="tags">
+    All stun, slow, and root effects carry child tags of `State.Control`. Combat rules that care about any form of crowd control query `HasTag("State.Control")` without enumerating specific types.
+  </Card>
+  <Card title="Pipeline Condition Checks" icon="code-branch">
+    A `AbilityConditionalPhase` can evaluate a tag query against the caster's container. If the caster holds `State.Channeling`, a subsequent cast attempt is gated.
+  </Card>
+  <Card title="Continuous Activation Rules" icon="circle-play">
+    `ITagConfig.BlockByTags` on a continuous runtime blocks activation while a matching tag is present. `PauseByTags` suspends the continuous automatically via `MobaContinuousTagRuleService`.
+  </Card>
+  <Card title="Config String Resolution" icon="link">
+    Config tables reference tags by string name. `MobaGameplayTagCatalog.RegisterAll` resolves those strings to `GameplayTag` handles at startup, catching typos before any gameplay tick.
+  </Card>
+  <Card title="Granted Tags on Effects" icon="gift">
+    `GameplayEffectSpec.GrantedTags` are applied to the target on effect Apply and withdrawn on Remove. Downstream rules that query those tags see consistent state throughout the effect's lifetime.
+  </Card>
+</CardGroup>
+
+## Tag Catalog Governance
+
+<Note>
+Your project **owns** the tag directory. The `GameplayTagManager` is a process-level mutable singleton with no catalog versioning built-in. Tag IDs are assigned based on registration order at startup and are not stable across different loading sequences, process restarts, or protocol versions.
+
+Recommended governance model:
+1. Maintain a single source-of-truth tag database (e.g., `GameplayTagDatabase` JSON file in version control).
+2. Generate a static code file (`RegisterAll` + typed accessors) from that database as a build step.
+3. Register all tags **before** any World initialisation — never dynamically during gameplay ticks.
+4. For network protocols, saved games, and replays, persist tag **names**, not raw `int` IDs or `ushort` NetIndex values.
+5. Version the tag catalog alongside your gameplay config. A client and server must agree on the exact catalog before the first tagged message is exchanged.
+</Note>
+
+## Known Limitations
+
+<Accordion title="ID Stability">
+`GameplayTag.Value` (the internal `int Id`) and `NetIndex` depend on registration order. They cannot be safely persisted to disk, sent over the network, or used in replay files without a stable catalog version and a fixed ordering guarantee. Always use tag **names** as the canonical protocol identity.
+</Accordion>
+
+<Accordion title="Deserialization Safety">
+`GameplayTagManager.FromId(n)` constructs a tag with a given ID but does **not** validate it against the current registry. `IsValid` only checks `Id != 0`. Feeding an out-of-range ID into hierarchy-walking APIs will throw `ArgumentOutOfRangeException`. All external data must be deserialised via `GameplayTagManager.Instance.RequestTag(name)` or `GetTagFromNetIndex` with catalog-version validation.
+</Accordion>
+
+<Accordion title="Owner Lease Isolation">
+`IGameplayTagService.GetTags(ownerId)` returns a **live internal reference**, not a snapshot. Direct mutation bypasses reference counting and event dispatch. Treat all returned containers as read-only borrows; route all writes through `AddTag` / `RemoveTag`.
+</Accordion>
+
+<Accordion title="Container.Empty is Mutable">
+`GameplayTagContainer.Empty` is a shared static instance. Any call site that mutates it corrupts the shared state for all other users. Always create `new GameplayTagContainer()` when you need an empty container.
+</Accordion>
+
+<Accordion title="GameplayTagQuery Builder Semantics">
+`RequireTags(a, b)` currently evaluates as **Any** (at least one), not **All**. For reliable All semantics, chain separate `RequireTags` calls or build an explicit expression tree. Use `GameplayTagRequirements` for production gate logic until the Query builder semantics are covered by automated tests.
+</Accordion>

@@ -1,0 +1,118 @@
+{
+  "projectType": "framework",
+  "projectName": "AbilityKit",
+  "projectDescription": "A modular game combat toolkit for mid-to-large scale projects, providing data-driven skill pipelines, event-triggered rule systems, a combat runtime, and multiple network synchronization modes — built in pure C# and usable across Unity, server, and test environments.",
+  "theme": "aspen",
+  "primaryColor": "#4F6DDE",
+  "lightColor": "#7A94E8",
+  "darkColor": "#2B4BBF",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "core-concepts",
+              "project-structure"
+            ]
+          },
+          {
+            "group": "Gameplay Modules",
+            "pages": [
+              "gameplay/skill-pipeline",
+              "gameplay/triggering-system",
+              "gameplay/ability-effects",
+              "gameplay/combat-primitives",
+              "gameplay/buff-continuous",
+              "gameplay/gameplay-tags"
+            ]
+          },
+          {
+            "group": "World & Runtime",
+            "pages": [
+              "runtime/logical-world",
+              "runtime/ecs-architecture",
+              "runtime/dependency-injection",
+              "runtime/flow-hfsm"
+            ]
+          },
+          {
+            "group": "Network Synchronization",
+            "pages": [
+              "networking/sync-overview",
+              "networking/frame-sync",
+              "networking/state-sync",
+              "networking/rollback-prediction",
+              "networking/replay-record",
+              "networking/session-coordination"
+            ]
+          },
+          {
+            "group": "Examples & Demos",
+            "pages": [
+              "examples/console-demo",
+              "examples/moba-demo",
+              "examples/shooter-demo",
+              "examples/tiny-starter"
+            ]
+          },
+          {
+            "group": "Engineering & Tooling",
+            "pages": [
+              "engineering/testing",
+              "engineering/configuration-codegen",
+              "engineering/diagnostics"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Data-driven skill pipeline with composable Phase graph (Sequence, Parallel, Conditional, Repeat, Timeline)",
+    "Event-triggered rule engine (TriggerRunner, TriggerPlan, ActionSchema, ExecCtx) for active/passive skills and buff ticks",
+    "Pure C# combat runtime usable on Unity client, dedicated server, console, and test environments",
+    "Multiple network sync modes: frame synchronization, state synchronization, client prediction/rollback",
+    "ECS architecture support with Entitas and Svelto adapters plus a lightweight built-in EntityWorld",
+    "Trace/lineage context tracking origin chains across skills, buffs, projectiles, and damage",
+    "Record and replay system with input, state hash, and snapshot tracks",
+    "Composable module system — adopt Foundation, SkillCore, BattleRuntime, SyncRuntime, or ServerRuntime incrementally",
+    "MOBA, Shooter, Tiny, Console, and ET reference demos demonstrating combat and sync capabilities",
+    "Orleans server integration for Gateway, Room, and authoritative Battle Host grains"
+  ],
+  "publicApiSurface": [
+    "com.abilitykit.core — math (Vec2/Vec3/Quat), object pool, event system, logger",
+    "com.abilitykit.pipeline — IAbilityPipelinePhase, AbilityCompositePhase, PipelineGraph, AbilityGatePhase, AbilityWaitUntilPhase",
+    "com.abilitykit.triggering — TriggerRunner, TriggerPlan, ActionSchemaRegistry, ExecCtx, EventBus, PlannedTriggerActionExecutor",
+    "com.abilitykit.ability — EffectService, EffectContainer, GameplayEffectSpec, EffectInstance, IEffectComponent",
+    "com.abilitykit.continuous — IContinuous, ContinuousManager, activation/pause/resume/terminate lifecycle",
+    "com.abilitykit.gameplaytags — GameplayTag hierarchy, container, query, stack",
+    "com.abilitykit.attributes — attribute system with Buff/Debuff, custom formulas, dirty-mark optimization",
+    "com.abilitykit.modifiers — generic parameter/attribute modifier for skills, projectiles, summons",
+    "com.abilitykit.trace — trace tree runtime, lineage context, parent/child chain tracking",
+    "com.abilitykit.world.di — DI container with Singleton/Scoped/Transient lifecycles",
+    "com.abilitykit.world.ecs — EntityWorld, IEntity, IEntityId, ComponentTypeId, EntityQuery",
+    "com.abilitykit.world.framesync — FrameSync, Rollback, ClientPrediction, PlayerInputCommand, FrameIndex",
+    "com.abilitykit.world.snapshot — FrameSnapshotDispatcher, snapshot routing by opCode",
+    "com.abilitykit.world.statesync — StateSync, Rollback, Per-Entity/ECSPrediction, StateHash",
+    "com.abilitykit.world.networkfragments — FramePacket, RemoteFrameBuffer, RemoteFrameAggregator",
+    "com.abilitykit.record — RecordContainer, EventTrack, FrameRecordSink, BasicReplayController",
+    "com.abilitykit.combat.targeting — TargetSearchEngine, SearchQuery, ICandidateProvider, ITargetRule, ITargetScorer, ITargetSelector",
+    "com.abilitykit.combat.projectile — ProjectileWorld, ProjectileSpawnParams, IProjectileHitPolicy, ProjectileRollbackProvider",
+    "com.abilitykit.combat.damage — DamageCalculationPipeline, DamageCalculationContext, DamageRequest, DamageResult",
+    "com.abilitykit.combat.motion — MotionPipeline, ConfigurableMotionSolver, IMotionSource",
+    "com.abilitykit.combat.collision.abstractions — ICollisionWorld, GridCollisionWorld, OBB sweep, GridBroadphase",
+    "com.abilitykit.combat.navigation — NavigationGrid, GridPathfinder, INavigationWorld, INavigationService",
+    "com.abilitykit.host — World management, client connection, message broadcast abstractions",
+    "com.abilitykit.host.extension — FramePacketNetAdapter, Session, Hook, Feature, Blueprint",
+    "com.abilitykit.flow — IFlowNode, FlowRunner, FlowContext, Sequence/Race/Parallel/If/Timeout/Await nodes",
+    "com.abilitykit.hfsm — StateMachine, ITriggerable, IAction, DecoratedState, TransitionAfter",
+    "com.abilitykit.network.sdk — login, Gateway, Room client facade",
+    "com.abilitykit.network.room — Room metadata, capability declaration, RoomGatewaySessionFlow",
+    "com.abilitykit.coordinator — SessionConfig, host/policy contracts, drive gate, DTO and codec"
+  ]
+}

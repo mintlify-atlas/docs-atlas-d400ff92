@@ -1,72 +1,87 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "AbilityKit",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#4F6DDE",
+    "light": "#7A94E8",
+    "dark": "#2B4BBF"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/HOBOBO/AbilityKit"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/HOBOBO/AbilityKit"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "core-concepts",
+              "project-structure"
+            ]
+          },
+          {
+            "group": "Gameplay Modules",
+            "pages": [
+              "gameplay/skill-pipeline",
+              "gameplay/triggering-system",
+              "gameplay/ability-effects",
+              "gameplay/combat-primitives",
+              "gameplay/buff-continuous",
+              "gameplay/gameplay-tags"
+            ]
+          },
+          {
+            "group": "World & Runtime",
+            "pages": [
+              "runtime/logical-world",
+              "runtime/ecs-architecture",
+              "runtime/dependency-injection",
+              "runtime/flow-hfsm"
+            ]
+          },
+          {
+            "group": "Network Synchronization",
+            "pages": [
+              "networking/sync-overview",
+              "networking/frame-sync",
+              "networking/state-sync",
+              "networking/rollback-prediction",
+              "networking/replay-record",
+              "networking/session-coordination"
+            ]
+          },
+          {
+            "group": "Examples & Demos",
+            "pages": [
+              "examples/console-demo",
+              "examples/moba-demo",
+              "examples/shooter-demo",
+              "examples/tiny-starter"
+            ]
+          },
+          {
+            "group": "Engineering & Tooling",
+            "pages": [
+              "engineering/testing",
+              "engineering/configuration-codegen",
+              "engineering/diagnostics"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }
